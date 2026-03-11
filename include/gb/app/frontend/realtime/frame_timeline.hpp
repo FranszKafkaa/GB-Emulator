@@ -1,8 +1,8 @@
 #pragma once
 
+#include <deque>
 #include <cstddef>
 #include <string>
-#include <vector>
 
 #include "gb/core/gameboy.hpp"
 
@@ -25,7 +25,7 @@ public:
 private:
     void truncateFuture();
 
-    std::vector<gb::GameBoy::SaveState> history_{};
+    std::deque<gb::GameBoy::SaveState> history_{};
     std::size_t cursor_ = 0;
 };
 

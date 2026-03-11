@@ -23,6 +23,7 @@
 #include "gb/app/frontend/realtime/replay_io.hpp"
 #include "gb/app/frontend/realtime/session_models.hpp"
 #include "gb/app/frontend/realtime/save_slots.hpp"
+#include "gb/app/frontend/realtime/timing_policy.hpp"
 #include "gb/app/frontend/realtime.hpp"
 #include "gb/app/frontend/realtime_support.hpp"
 
@@ -596,10 +597,10 @@ int runRealtime(
     std::thread emuThread([&]() {
         std::cout << "[MT][EMU] worker iniciado\n";
         std::mt19937 emuRng(std::random_device{}());
-    std::uniform_int_distribution<int> emuRandByte(0, 255);
-    const auto frameBudget = std::chrono::microseconds(16742);
-    auto nextFrame = std::chrono::steady_clock::now();
-    auto lastLog = std::chrono::steady_clock::now();
+        std::uniform_int_distribution<int> emuRandByte(0, 255);
+        auto nextFrame = std::chrono::steady_clock::now();
+        auto lastLog = std::chrono::steady_clock::now();
+        bool lastFastForward = fastForwardAtomic.load(std::memory_order_relaxed);
         std::uint64_t logFrames = 0;
         std::size_t audioDropLogs = 0;
 
@@ -611,7 +612,13 @@ int runRealtime(
             }
 
             const bool ff = fastForwardAtomic.load(std::memory_order_relaxed);
-            const int framesToRun = ff ? 6 : 1;
+            if (ff != lastFastForward) {
+                nextFrame = std::chrono::steady_clock::now();
+                lastFastForward = ff;
+            }
+
+            const auto frameBudget = emulationFrameBudget(ff);
+            const int framesToRun = emulationFramesPerTick(ff);
             for (int i = 0; i < framesToRun && mtRunning.load(std::memory_order_relaxed); ++i) {
                 const bool watchEnabled = watchpointEnabledAtomic.load(std::memory_order_relaxed);
                 const gb::u16 watchAddr = watchAddressAtomic.load(std::memory_order_relaxed);
@@ -651,7 +658,7 @@ int runRealtime(
                     }
 
                     gb.runFrame();
-                    emulatedFrameCounter.fetch_add(1, std::memory_order_relaxed);
+                    const std::uint64_t frameCount = emulatedFrameCounter.fetch_add(1, std::memory_order_relaxed) + 1;
 
                     if (cheatsEnabledAtomic.load(std::memory_order_relaxed) && !cheats.empty()) {
                         applyCheats(cheats, gb.bus());
@@ -687,7 +694,10 @@ int runRealtime(
                         }
                     }
 
-                    timeline.captureCurrent(gb);
+                    const bool captureRewindFrame = !ff || ((frameCount & 1ULL) == 0ULL);
+                    if (captureRewindFrame) {
+                        timeline.captureCurrent(gb);
+                    }
                     enqueueRawFrameLocked();
                     pc = gb.cpu().regs().pc;
 
@@ -733,16 +743,13 @@ int runRealtime(
                 ++logFrames;
             }
 
-            if (!ff) {
-                nextFrame += frameBudget;
-                std::this_thread::sleep_until(nextFrame);
-                const auto now = std::chrono::steady_clock::now();
-                if (now - nextFrame > std::chrono::milliseconds(100)) {
-                    nextFrame = now;
-                }
+            nextFrame += frameBudget;
+            std::this_thread::sleep_until(nextFrame);
+            const auto now = std::chrono::steady_clock::now();
+            if (now - nextFrame > std::chrono::milliseconds(ff ? 40 : 100)) {
+                nextFrame = now;
             }
 
-            const auto now = std::chrono::steady_clock::now();
             if (now - lastLog >= std::chrono::seconds(5)) {
                 const double seconds = std::chrono::duration<double>(now - lastLog).count();
                 const double fps = seconds > 0.0 ? static_cast<double>(logFrames) / seconds : 0.0;

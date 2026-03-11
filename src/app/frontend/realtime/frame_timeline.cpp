@@ -10,7 +10,6 @@ FrameTimeline::FrameTimeline(const gb::GameBoy& gb) {
 
 void FrameTimeline::reset(const gb::GameBoy& gb) {
     history_.clear();
-    history_.reserve(MaxHistory + 8);
     history_.push_back(gb.saveState());
     cursor_ = 0;
 }
@@ -37,7 +36,10 @@ void FrameTimeline::captureCurrent(const gb::GameBoy& gb) {
     truncateFuture();
     history_.push_back(gb.saveState());
     if (history_.size() > MaxHistory) {
-        history_.erase(history_.begin());
+        history_.pop_front();
+        if (cursor_ > 0) {
+            --cursor_;
+        }
     }
     cursor_ = history_.size() - 1;
 }
@@ -52,7 +54,9 @@ std::size_t FrameTimeline::size() const {
 
 void FrameTimeline::truncateFuture() {
     if (cursor_ + 1 < history_.size()) {
-        history_.erase(history_.begin() + static_cast<std::ptrdiff_t>(cursor_ + 1), history_.end());
+        while (history_.size() > cursor_ + 1) {
+            history_.pop_back();
+        }
     }
 }
 

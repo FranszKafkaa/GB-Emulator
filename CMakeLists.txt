@@ -81,6 +81,7 @@ if (BUILD_TESTING)
         src/app/frontend/realtime/replay_io.cpp
         src/app/frontend/realtime/control_bindings.cpp
         src/app/frontend/realtime/link_transport.cpp
+        src/app/frontend/realtime/frame_timeline.cpp
         tests/test_main.cpp
         tests/cpu_behavior_tests.cpp
         tests/cartridge_tests.cpp

@@ -26,6 +26,7 @@ public:
     void runFrame();
 
     [[nodiscard]] const Cartridge& cartridge() const;
+    [[nodiscard]] CPU& cpu();
     [[nodiscard]] const CPU& cpu() const;
     [[nodiscard]] const PPU& ppu() const;
     [[nodiscard]] Bus& bus();

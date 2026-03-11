@@ -20,10 +20,9 @@ bool GameBoy::loadBootRomFromFile(const std::string& path) {
     if (!in) {
         return false;
     }
-    std::vector<u8> data(
-        std::istreambuf_iterator<char>(in),
-        std::istreambuf_iterator<char>()
-    );
+    const auto begin = std::istreambuf_iterator<char>(in);
+    const auto end = std::istreambuf_iterator<char>();
+    std::vector<u8> data{begin, end};
     if (data.empty()) {
         return false;
     }
@@ -55,8 +54,11 @@ u32 GameBoy::step() {
 void GameBoy::runFrame() {
     if (preciseTiming_) {
         bool seenVblank = false;
-        while (true) {
-            step();
+        u32 elapsed = 0;
+        // Guarda contra travamento se o jogo desligar LCD (LY pode parar de variar).
+        constexpr u32 maxGuardCycles = 70224 * 3;
+        while (elapsed < maxGuardCycles) {
+            elapsed += step();
             const u8 ly = bus_.peek(0xFF44);
             if (!seenVblank && ly >= 144) {
                 seenVblank = true;
@@ -77,6 +79,10 @@ void GameBoy::runFrame() {
 
 const Cartridge& GameBoy::cartridge() const {
     return cartridge_;
+}
+
+CPU& GameBoy::cpu() {
+    return cpu_;
 }
 
 const CPU& GameBoy::cpu() const {

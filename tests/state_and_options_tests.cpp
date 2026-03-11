@@ -229,6 +229,24 @@ TEST_CASE("state", "precise_timing_flag_updates_runtime_mode") {
     T_REQUIRE(!gb.preciseTiming());
 }
 
+TEST_CASE("state", "precise_timing_runframe_returns_when_lcd_off") {
+    tests::RomSpec spec{};
+    spec.name = "precise_lcd_off";
+    spec.program = {0x76};
+
+    gb::GameBoy gb;
+    tests::ScopedPath cleanup;
+    loadRomOrThrow(gb, spec, cleanup);
+    gb.setPreciseTiming(true);
+
+    // LCD off: em alguns jogos/transicoes o LY pode ficar estavel.
+    gb.bus().write(0xFF40, 0x00);
+    gb.runFrame();
+
+    // Se chegou ate aqui, nao travou em loop infinito.
+    T_REQUIRE(true);
+}
+
 TEST_CASE("options", "defaults_when_no_args") {
     gb::AppOptions options;
     std::string error;

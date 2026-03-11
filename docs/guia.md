@@ -11,6 +11,25 @@ Este documento foi escrito para voce entender o projeto inteiro com calma, inclu
 - como o modo debug funciona por dentro
 - como a arquitetura multithread foi montada
 
+## Nota de manutencao (2026-03-11)
+
+Foi aplicada uma correcao de compilacao em `src/core/gameboy.cpp` no metodo `loadBootRomFromFile`.
+
+Detalhe tecnico:
+
+- a leitura do Boot ROM usava inicializacao que podia cair no erro de parse ambiguo do C++ (most vexing parse)
+- agora o codigo separa iteradores `begin/end` e cria o `std::vector<u8>` sem ambiguidade
+- o fast forward (`Tab`) foi ajustado para modo com pacing (sem burst de 6 frames por ciclo)
+- o rewind interno foi otimizado para evitar travadas: saiu de `vector` com `erase(begin)` para fila com `pop_front` O(1)
+- `runFrame` em modo de timing preciso ganhou guarda de ciclos para evitar loop infinito quando LCD estiver desligado
+
+Impacto:
+
+- remove erro de build em compiladores mais estritos
+- nao muda comportamento funcional da emulacao
+- reduz sensacao de "pulo de frame" no fast forward
+- reduz travadas no fast forward em sessoes longas (historico cheio de rewind)
+
 ## 0. Como ler este guia
 
 Para ficar didatico, cada secao segue este formato:
@@ -297,8 +316,9 @@ Logs de diagnostico no terminal:
 - coleta samples da APU e empurra no ring buffer
 - aplica lock de memoria por frame quando ativo
 - detecta watchpoint e breakpoint
-- se fast forward ativo, roda 6 frames por ciclo
-- se nao fast forward, tenta ritmo de ~59.7 fps (`16742 us`)
+- usa politica de timing:
+  - normal: ~59.7 fps (`16742 us`)
+  - fast forward: ~3x com pacing, sem burst por ciclo
 
 #### Thread RENDER
 

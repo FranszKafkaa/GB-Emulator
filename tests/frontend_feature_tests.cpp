@@ -5,9 +5,11 @@
 
 #include "gb/app/frontend/realtime/cheat_engine.hpp"
 #include "gb/app/frontend/realtime/control_bindings.hpp"
+#include "gb/app/frontend/realtime/frame_timeline.hpp"
 #include "gb/app/frontend/realtime/link_transport.hpp"
 #include "gb/app/frontend/realtime/replay_io.hpp"
 #include "gb/app/frontend/realtime/save_slots.hpp"
+#include "gb/app/frontend/realtime/timing_policy.hpp"
 #include "gb/core/gameboy.hpp"
 
 #include "test_framework.hpp"
@@ -162,4 +164,35 @@ TEST_CASE("frontend", "link_endpoint_parser") {
         const auto ep = gb::frontend::parseLinkEndpoint("1.2.3.4:70000");
         T_REQUIRE(!ep.has_value());
     }
+}
+
+TEST_CASE("frontend", "fast_forward_timing_policy_is_paced") {
+    const auto normalBudget = gb::frontend::emulationFrameBudget(false);
+    const auto ffBudget = gb::frontend::emulationFrameBudget(true);
+
+    T_EQ(normalBudget.count(), static_cast<long long>(16742));
+    T_REQUIRE(ffBudget.count() > 0);
+    T_REQUIRE(ffBudget < normalBudget);
+    T_EQ(ffBudget.count(), normalBudget.count() / gb::frontend::kFastForwardMultiplier);
+    T_EQ(gb::frontend::emulationFramesPerTick(false), 1);
+    T_EQ(gb::frontend::emulationFramesPerTick(true), 1);
+}
+
+TEST_CASE("frontend", "frame_timeline_keeps_fixed_size_and_navigation") {
+    gb::GameBoy gb;
+    tests::ScopedPath cleanup;
+    loadBlankRom(gb, cleanup);
+
+    gb::frontend::FrameTimeline timeline(gb);
+    for (std::size_t i = 0; i < gb::frontend::FrameTimeline::MaxHistory + 64; ++i) {
+        timeline.captureCurrent(gb);
+    }
+
+    T_EQ(timeline.size(), gb::frontend::FrameTimeline::MaxHistory);
+    T_EQ(timeline.position(), timeline.size());
+
+    T_REQUIRE(timeline.stepBack(gb));
+    T_EQ(timeline.position(), timeline.size() - 1);
+    T_REQUIRE(timeline.stepForward(gb));
+    T_EQ(timeline.position(), timeline.size());
 }
