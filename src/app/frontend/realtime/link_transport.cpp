@@ -19,6 +19,7 @@ namespace {
 constexpr std::uint32_t kMagic = 0x4B4E494C; // LINK
 constexpr std::uint8_t kTypeSerial = 1;
 constexpr std::uint8_t kTypeNetplay = 2;
+constexpr std::uint8_t kTypeChecksum = 3;
 
 #pragma pack(push, 1)
 struct LinkPacket {
@@ -26,6 +27,7 @@ struct LinkPacket {
     std::uint8_t type = 0;
     std::uint64_t frame = 0;
     std::uint8_t value = 0;
+    std::uint32_t checksum = 0;
 };
 #pragma pack(pop)
 
@@ -102,6 +104,7 @@ void UdpLinkTransport::close() {
 #endif
     remoteKnown_ = false;
     netplayInputs_.clear();
+    netplayChecksums_.clear();
     lastRemoteInput_ = 0;
     lastRemoteSerial_ = 0xFF;
 }
@@ -180,6 +183,23 @@ std::vector<std::pair<std::uint64_t, std::uint8_t>> UdpLinkTransport::takeAllNet
     return out;
 }
 
+bool UdpLinkTransport::sendNetplayChecksum(std::uint64_t frame, std::uint32_t checksum) {
+    if (!isOpen()) {
+        return false;
+    }
+    return sendPacket(kTypeChecksum, frame, 0, checksum);
+}
+
+bool UdpLinkTransport::takeNetplayChecksum(std::uint64_t frame, std::uint32_t& checksum) {
+    const auto it = netplayChecksums_.find(frame);
+    if (it == netplayChecksums_.end()) {
+        return false;
+    }
+    checksum = it->second;
+    netplayChecksums_.erase(it);
+    return true;
+}
+
 bool UdpLinkTransport::openSocket(std::uint16_t localPort) {
 #ifdef __unix__
     close();
@@ -249,12 +269,14 @@ void UdpLinkTransport::drainIncoming() {
             lastRemoteSerial_ = packet.value;
         } else if (packet.type == kTypeNetplay) {
             netplayInputs_[packet.frame] = packet.value;
+        } else if (packet.type == kTypeChecksum) {
+            netplayChecksums_[packet.frame] = packet.checksum;
         }
     }
 #endif
 }
 
-bool UdpLinkTransport::sendPacket(std::uint8_t type, std::uint64_t frame, std::uint8_t value) {
+bool UdpLinkTransport::sendPacket(std::uint8_t type, std::uint64_t frame, std::uint8_t value, std::uint32_t checksum) {
 #ifdef __unix__
     if (socketFd_ < 0 || !remoteKnown_) {
         return false;
@@ -263,6 +285,7 @@ bool UdpLinkTransport::sendPacket(std::uint8_t type, std::uint64_t frame, std::u
     packet.type = type;
     packet.frame = frame;
     packet.value = value;
+    packet.checksum = checksum;
 
     const ssize_t sent = sendto(
         socketFd_,
@@ -277,6 +300,7 @@ bool UdpLinkTransport::sendPacket(std::uint8_t type, std::uint64_t frame, std::u
     (void)type;
     (void)frame;
     (void)value;
+    (void)checksum;
     return false;
 #endif
 }

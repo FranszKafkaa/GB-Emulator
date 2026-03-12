@@ -7,6 +7,7 @@
 #include "gb/app/frontend/realtime/control_bindings.hpp"
 #include "gb/app/frontend/realtime/frame_timeline.hpp"
 #include "gb/app/frontend/realtime/link_transport.hpp"
+#include "gb/app/frontend/realtime/network_config.hpp"
 #include "gb/app/frontend/realtime/replay_io.hpp"
 #include "gb/app/frontend/realtime/save_slots.hpp"
 #include "gb/app/frontend/realtime/timing_policy.hpp"
@@ -198,6 +199,44 @@ TEST_CASE("frontend", "link_endpoint_parser") {
     }
 }
 
+TEST_CASE("frontend", "link_transport_closed_mode_behaviour") {
+    gb::frontend::UdpLinkTransport transport{};
+    T_REQUIRE(!transport.isOpen());
+
+    std::uint8_t remote = 0x00;
+    bool predicted = true;
+    T_REQUIRE(!transport.exchangeSerialByte(0x12, remote));
+    T_EQ(remote, static_cast<std::uint8_t>(0xFF));
+    T_REQUIRE(!transport.exchangeNetplayInput(1, 0x34, remote, predicted));
+    T_EQ(remote, static_cast<std::uint8_t>(0x00));
+    T_REQUIRE(!predicted);
+
+    transport.pump();
+
+    std::uint8_t v = 0;
+    std::uint32_t checksum = 0;
+    T_REQUIRE(!transport.takeNetplayInput(1, v));
+    T_REQUIRE(!transport.takeNetplayChecksum(1, checksum));
+    T_REQUIRE(!transport.sendNetplayChecksum(1, 0x12345678u));
+    const auto all = transport.takeAllNetplayInputs();
+    T_REQUIRE(all.empty());
+}
+
+TEST_CASE("frontend", "network_config_roundtrip") {
+    const auto path = tests::makeTempPath("network_cfg", ".cfg");
+    tests::ScopedPath cleanup(path);
+
+    gb::frontend::NetworkFrontendConfig cfg{};
+    cfg.netplayDelayFrames = 7;
+    cfg.linkMode = 3;
+    T_REQUIRE(gb::frontend::saveNetworkFrontendConfig(path.string(), cfg));
+
+    const auto loaded = gb::frontend::loadNetworkFrontendConfig(path.string());
+    T_REQUIRE(loaded.has_value());
+    T_EQ(loaded->netplayDelayFrames, 7);
+    T_EQ(loaded->linkMode, 3);
+}
+
 TEST_CASE("frontend", "fast_forward_timing_policy_is_paced") {
     const auto normalBudget = gb::frontend::emulationFrameBudget(false);
     const auto ffBudget = gb::frontend::emulationFrameBudget(true);
@@ -249,4 +288,19 @@ TEST_CASE("frontend", "top_menu_section_and_action_hit_test") {
 
     const auto outside = gb::frontend::hitTestTopMenuAction(outputW, gb::frontend::TopMenuSection::Session, drop.x - 2, drop.y - 2);
     T_REQUIRE(!outside.has_value());
+
+    const auto netRect = gb::frontend::topMenuSectionRect(outputW, gb::frontend::TopMenuSection::Network);
+    const auto netHit = gb::frontend::hitTestTopMenuSection(outputW, netRect.x + 2, netRect.y + 2);
+    T_REQUIRE(netHit.has_value());
+    T_EQ(static_cast<int>(netHit.value()), static_cast<int>(gb::frontend::TopMenuSection::Network));
+
+    const auto netDrop = gb::frontend::topMenuDropdownRect(outputW, gb::frontend::TopMenuSection::Network);
+    const auto netAction = gb::frontend::hitTestTopMenuAction(
+        outputW,
+        gb::frontend::TopMenuSection::Network,
+        netDrop.x + 6,
+        netDrop.y + 6
+    );
+    T_REQUIRE(netAction.has_value());
+    T_EQ(static_cast<int>(netAction.value()), static_cast<int>(gb::frontend::TopMenuAction::CycleLinkMode));
 }

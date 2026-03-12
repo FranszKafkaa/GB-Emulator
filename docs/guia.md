@@ -35,6 +35,11 @@ Detalhe tecnico:
 - RTC de MBC3/HuC3 agora usa relogio real (`system_clock`) e compensa tempo offline ao reabrir
 - serial/link agora respeita tempo de transferencia por byte (normal e fast mode CGB)
 - netplay ganhou `--netplay-delay` e rollback simples quando input remoto atrasado diverge da previsao
+- netplay passou a trocar checksum por frame para detectar dessync real
+- ao detectar checksum divergente, a emulacao pausa com aviso `NETPLAY DESYNC`
+- preferencias de rede (`link mode` + `netplay delay`) agora ficam em `states/global.network`
+- mapper MMM01 ganhou implementacao dedicada (nao e mais alias de MBC1)
+- mapper HuC3 ganhou camada dedicada sobre MBC3 com estado estendido persistente
 
 Impacto:
 
@@ -53,6 +58,9 @@ Impacto:
 - melhora confiabilidade de eventos dependentes de relogio em jogos com RTC
 - melhora compatibilidade de jogos que esperam interrupcao serial em janela temporal mais fiel
 - reduz dessync visual em netplay sob jitter com re-simulacao automatica
+- reduz risco de partidas seguirem divergidas em silencio (detecao de dessync por checksum)
+- evita reconfigurar delay/mode de rede a cada abertura do emulador
+- melhora compatibilidade com cartuchos MMM01/HuC3
 
 ## 0. Como ler este guia
 
@@ -165,6 +173,11 @@ Opcoes:
 - `--hardware <auto|dmg|cgb>`: seleciona o hardware emulado para ROM dual-mode.
 - `--netplay-delay <0..10>`: atraso de entrada para netplay com rollback simples.
 
+Detalhe de runtime:
+
+- durante netplay, cada lado envia checksum de frame para detectar divergencia.
+- em divergencia, o frontend pausa e mostra `NETPLAY DESYNC`.
+
 Tambem aceita ROM como argumento posicional:
 
 ```bash
@@ -186,6 +199,7 @@ Para cada ROM, o projeto usa um nome base (`stem`) e grava em `states/`:
 - `.palette`: preferencia da paleta visual
 - `.filters`: preferencia de filtro visual
 - `.controls`, `.cheats`, `.replay`: reservados
+- `global.network`: preferencias globais de netplay (delay + modo do link)
 
 Capturas vao para:
 
@@ -668,6 +682,7 @@ Comportamento:
 - `F3` oculta/mostra a barra inteira
 - hover no mouse destaca secao e item
 - itens aparecem quando disponiveis no contexto atual (por exemplo, `MENU ESCALA` apenas em fullscreen)
+- alteracoes de `REDE` persistem em `states/global.network`
 
 ### 14.7 Fechamento por `X`
 
@@ -845,6 +860,8 @@ Arquivos principais:
 - `src/core/cartridge/mappers/mbc2.cpp`
 - `src/core/cartridge/mappers/mbc3.cpp`
 - `src/core/cartridge/mappers/mbc5.cpp`
+- `src/core/cartridge/mappers/mmm01.cpp`
+- `src/core/cartridge/mappers/huc3.cpp`
 
 ### 17.1 O que ficou em `cartridge.cpp`
 
@@ -862,6 +879,11 @@ Cada arquivo de mapper implementa:
 - leitura de ROM/RAM conforme regras do banco
 - escrita de controle de banco
 - serializacao de estado interno do mapper
+
+Casos novos:
+
+- `MMM01`: fase de mapeamento inicial + lock de mapeamento + banking dedicado
+- `HuC3`: comandos virtuais em janela RAM e estado extra salvo no save state
 
 Beneficio tecnico:
 

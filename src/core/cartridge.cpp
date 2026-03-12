@@ -71,8 +71,8 @@ bool Cartridge::loadFromFile(const std::string& path) {
         mapper_ = cartridge_mapper::makeNoMbcMapper(rom_, ram_);
     } else if (type >= 0x01 && type <= 0x03) {
         mapper_ = cartridge_mapper::makeMbc1Mapper(rom_, ram_);
-    } else if (type >= 0x0B && type <= 0x0D) { // MMM01 family (fallback)
-        mapper_ = cartridge_mapper::makeMbc1Mapper(rom_, ram_);
+    } else if (type >= 0x0B && type <= 0x0D) { // MMM01 family
+        mapper_ = cartridge_mapper::makeMmm01Mapper(rom_, ram_);
     } else if (type == 0x05 || type == 0x06) {
         mapper_ = cartridge_mapper::makeMbc2Mapper(rom_, ram_);
     } else if (type >= 0x0F && type <= 0x13) {

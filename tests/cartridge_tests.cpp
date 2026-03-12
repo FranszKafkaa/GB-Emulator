@@ -180,6 +180,26 @@ TEST_CASE("cartridge", "mbc1_ram_bank_mode") {
     T_EQ(cart.read(0xA000), 0x22);
 }
 
+TEST_CASE("cartridge", "mmm01_switches_rom_bank_after_mapping_lock") {
+    tests::RomSpec spec{};
+    spec.name = "cart_mmm01_rom_bank";
+    spec.cartridgeType = 0x0B;
+    spec.romBanks = 8;
+    spec.fillBanksWithIndex = true;
+
+    tests::ScopedPath cleanup;
+    auto cart = loadCartridgeOrThrow(spec, cleanup);
+
+    // Antes do lock, escrita em 0x2000 ajusta base.
+    cart.write(0x2000, 0x02);
+    T_EQ(cart.read(0x0000), 0x02);
+
+    // Lock de mapeamento via RAM enable.
+    cart.write(0x0000, 0x0A);
+    cart.write(0x2000, 0x03);
+    T_EQ(cart.read(0x4000), 0x05);
+}
+
 TEST_CASE("cartridge", "mbc5_switches_rom_bank") {
     tests::RomSpec spec{};
     spec.name = "cart_mbc5_rom_bank";
@@ -216,6 +236,26 @@ TEST_CASE("cartridge", "mbc5_ram_bank_switch") {
 
     cart.write(0x4000, 0x01);
     T_EQ(cart.read(0xA000), 0x44);
+}
+
+TEST_CASE("cartridge", "huc3_virtual_command_register_roundtrip") {
+    tests::RomSpec spec{};
+    spec.name = "cart_huc3_virtual_cmd";
+    spec.cartridgeType = 0xFE;
+    spec.ramCode = 0x03;
+
+    tests::ScopedPath cleanup;
+    auto cart = loadCartridgeOrThrow(spec, cleanup);
+
+    cart.write(0x0000, 0x1A); // modo HuC3 comando 0x0A
+    cart.write(0xA000, 0x0D);
+    cart.write(0x0000, 0x1B); // comando 0x0B (read)
+    T_EQ(cart.read(0xA000), static_cast<gb::u8>(0x0D));
+
+    const auto saved = cart.state();
+    cart.write(0xA000, 0x01);
+    cart.loadState(saved);
+    T_EQ(cart.read(0xA000), static_cast<gb::u8>(0x0D));
 }
 
 TEST_CASE("cartridge", "state_roundtrip_restores_mapper_and_ram") {
@@ -449,7 +489,7 @@ TEST_CASE("cartridge", "rtc_file_ops_fail_without_timer_hardware") {
     T_REQUIRE(!cart.loadRtcFromFile(rtcPath.string()));
 }
 
-TEST_CASE("cartridge", "mmm01_mapper_family_falls_back_to_mbc1_behavior") {
+TEST_CASE("cartridge", "mmm01_uses_base_bank_before_mapping_lock") {
     tests::RomSpec spec{};
     spec.name = "cart_mmm01_alias";
     spec.cartridgeType = 0x0B;
@@ -460,7 +500,8 @@ TEST_CASE("cartridge", "mmm01_mapper_family_falls_back_to_mbc1_behavior") {
     auto cart = loadCartridgeOrThrow(spec, cleanup);
 
     cart.write(0x2000, 0x02);
-    T_EQ(cart.read(0x4000), 0x02);
+    // Antes do lock, o MMM01 aplica baseBank + romBankLow (default=1).
+    T_EQ(cart.read(0x4000), 0x03);
 }
 
 TEST_CASE("cartridge", "mbc7_fallback_exposes_small_persistent_ram") {

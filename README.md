@@ -1,4 +1,4 @@
-# Game Boy Emulator (C++)
+# OrbitalBoy Game Boy Emulator (C++)
 
 ![Preview do emulador](image/image.png)
 
@@ -93,6 +93,7 @@ Regras:
 
 - `--netplay-delay <0..10>` ajusta atraso de entrada para estabilizar partidas com latencia.
 - quando um input remoto atrasado chega e diverge da previsao, o emulador aplica rollback simples.
+- cada frame envia checksum para detectar dessync; ao detectar divergencia, a emulacao pausa com aviso visual.
 
 ## Estrutura esperada de ROMs (seletor SDL)
 
@@ -188,6 +189,7 @@ No menu `REDE`:
 
 - ciclar modo do link cable (equivalente a `J`)
 - ajustar delay do netplay em tempo real (`0..10` frames)
+- configuracao de rede fica persistida em `states/global.network`
 
 ## Fechar janelas pop-up
 
@@ -214,6 +216,7 @@ Arquivos sao salvos em `./states/` por nome da ROM (`<rom>.ext`):
 - `.rtc`: relogio RTC (MBC3/HuC3) com timestamp real para compensar tempo offline
 - `.palette`: preferencia de paleta
 - `.filters`: preferencia de filtro
+- `global.network`: preferencias globais de link mode e netplay delay
 
 Capturas vao para `./captures/<rom>/`.
 

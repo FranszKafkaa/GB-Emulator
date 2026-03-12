@@ -10,6 +10,7 @@ namespace cartridge_mapper {
 
 std::unique_ptr<Mapper> makeNoMbcMapper(std::vector<u8>& rom, std::vector<u8>& ram);
 std::unique_ptr<Mapper> makeMbc1Mapper(std::vector<u8>& rom, std::vector<u8>& ram);
+std::unique_ptr<Mapper> makeMmm01Mapper(std::vector<u8>& rom, std::vector<u8>& ram);
 std::unique_ptr<Mapper> makeMbc2Mapper(std::vector<u8>& rom, std::vector<u8>& ram);
 std::unique_ptr<Mapper> makeMbc3Mapper(std::vector<u8>& rom, std::vector<u8>& ram);
 std::unique_ptr<Mapper> makeMbc5Mapper(std::vector<u8>& rom, std::vector<u8>& ram);

@@ -25,6 +25,7 @@
 #include "gb/app/frontend/realtime/dropping_queue.hpp"
 #include "gb/app/frontend/realtime/frame_timeline.hpp"
 #include "gb/app/frontend/realtime/link_transport.hpp"
+#include "gb/app/frontend/realtime/network_config.hpp"
 #include "gb/app/frontend/realtime/replay_io.hpp"
 #include "gb/app/frontend/realtime/session_models.hpp"
 #include "gb/app/frontend/realtime/save_slots.hpp"
@@ -60,6 +61,7 @@ int runRealtime(
     int netplayHostPort,
     int netplayDelayFrames
 ) {
+    (void)replayPath;
     SDL_SetHint(SDL_HINT_RENDER_VSYNC, "1");
     SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
@@ -224,16 +226,37 @@ int runRealtime(
         bool predicted = false;
     };
     constexpr std::size_t kNetplayHistoryLimit = 180;
-    const int initialNetplayDelay = std::clamp(netplayDelayFrames, 0, 10);
-    std::atomic<int> netplayDelayAtomic{initialNetplayDelay};
+    const std::string networkConfigPath = (std::filesystem::path("states") / "global.network").string();
+    int configuredNetplayDelay = std::clamp(netplayDelayFrames, 0, 10);
+    const auto savedNetwork = loadNetworkFrontendConfig(networkConfigPath);
+    if (configuredNetplayDelay == 0 && savedNetwork.has_value()) {
+        configuredNetplayDelay = std::clamp(savedNetwork->netplayDelayFrames, 0, 10);
+    }
+    std::atomic<int> netplayDelayAtomic{configuredNetplayDelay};
     std::deque<std::uint8_t> localInputDelayQueue{};
-    for (int i = 0; i < initialNetplayDelay; ++i) {
+    for (int i = 0; i < configuredNetplayDelay; ++i) {
         localInputDelayQueue.push_back(0);
     }
     std::deque<NetplayFrameRecord> netplayHistory{};
     std::unordered_map<std::uint64_t, std::uint8_t> netplayAuthoritativeInputs{};
+    std::unordered_map<std::uint64_t, std::uint32_t> localFrameChecksums{};
+    std::uint64_t netplayRollbackCount = 0;
+    std::uint64_t netplayDesyncCount = 0;
+    std::uint64_t netplayPredictedCount = 0;
     if (socketLinkAvailable) {
         linkCableMode = LinkCableMode::Socket;
+    }
+    if (savedNetwork.has_value()) {
+        const int savedMode = std::clamp(savedNetwork->linkMode, 0, 3);
+        if (savedMode == 0) {
+            linkCableMode = LinkCableMode::Off;
+        } else if (savedMode == 1) {
+            linkCableMode = LinkCableMode::Loopback;
+        } else if (savedMode == 2) {
+            linkCableMode = LinkCableMode::Noise;
+        } else if (savedMode == 3 && socketLinkAvailable) {
+            linkCableMode = LinkCableMode::Socket;
+        }
     }
     int paletteMenuIndex = static_cast<int>(paletteMode);
     FrameTimeline timeline(gb);
@@ -331,6 +354,22 @@ int runRealtime(
         joypad.setButton(gb::Button::B, (mask & (1u << 5)) != 0);
         joypad.setButton(gb::Button::Select, (mask & (1u << 6)) != 0);
         joypad.setButton(gb::Button::Start, (mask & (1u << 7)) != 0);
+    };
+    const auto frameChecksum = [](const gb::GameBoy& gameBoy) -> std::uint32_t {
+        std::uint32_t hash = 2166136261u; // FNV-1a seed
+        const auto& fb = gameBoy.ppu().framebuffer();
+        for (const auto px : fb) {
+            hash ^= static_cast<std::uint32_t>(px);
+            hash *= 16777619u;
+        }
+        const auto& regs = gameBoy.cpu().regs();
+        const std::uint16_t pc = regs.pc;
+        const std::uint16_t sp = regs.sp;
+        hash ^= static_cast<std::uint32_t>(pc);
+        hash *= 16777619u;
+        hash ^= static_cast<std::uint32_t>(sp);
+        hash *= 16777619u;
+        return hash;
     };
 
     const auto queueMemoryWrite = [&](gb::u16 address, gb::u8 value, const char* source) {
@@ -902,6 +941,9 @@ int runRealtime(
                         } else {
                             (void)netplayTransport.exchangeNetplayInput(frameId, localAppliedMask, remoteMask, predicted);
                         }
+                        if (predicted) {
+                            ++netplayPredictedCount;
+                        }
                         netplayFrameRecord = NetplayFrameRecord{
                             frameId,
                             gb.saveState(),
@@ -922,6 +964,24 @@ int runRealtime(
                     }
 
                     if (netplayEnabled && !replayPlayingNow) {
+                        const std::uint32_t checksum = frameChecksum(gb);
+                        localFrameChecksums[frameId] = checksum;
+                        while (localFrameChecksums.size() > kNetplayHistoryLimit) {
+                            std::uint64_t minFrame = std::numeric_limits<std::uint64_t>::max();
+                            for (const auto& entry : localFrameChecksums) {
+                                if (entry.first < minFrame) {
+                                    minFrame = entry.first;
+                                }
+                            }
+                            if (minFrame == std::numeric_limits<std::uint64_t>::max()) {
+                                break;
+                            }
+                            localFrameChecksums.erase(minFrame);
+                        }
+                        (void)netplayTransport.sendNetplayChecksum(frameId, checksum);
+                    }
+
+                    if (netplayEnabled && !replayPlayingNow) {
                         if (netplayFrameRecord.has_value()) {
                             netplayHistory.push_back(std::move(netplayFrameRecord.value()));
                             while (netplayHistory.size() > kNetplayHistoryLimit) {
@@ -933,6 +993,21 @@ int runRealtime(
 
                         netplayTransport.pump();
                         const auto lateInputs = netplayTransport.takeAllNetplayInputs();
+                        for (const auto& local : localFrameChecksums) {
+                            std::uint32_t remoteChecksum = 0;
+                            if (netplayTransport.takeNetplayChecksum(local.first, remoteChecksum)) {
+                                if (remoteChecksum != local.second) {
+                                    ++netplayDesyncCount;
+                                    pausedAtomic.store(true, std::memory_order_relaxed);
+                                    fastForwardAtomic.store(false, std::memory_order_relaxed);
+                                    pendingPauseAddr.store(gb.cpu().regs().pc, std::memory_order_relaxed);
+                                    pendingPauseReason.store(3, std::memory_order_relaxed);
+                                    forceTitleRefresh.store(true, std::memory_order_relaxed);
+                                    uiMessage = "NETPLAY DESYNC";
+                                    uiMessageFrames = 180;
+                                }
+                            }
+                        }
                         std::optional<std::uint64_t> rollbackFrom{};
                         for (const auto& late : lateInputs) {
                             netplayAuthoritativeInputs[late.first] = late.second;
@@ -973,12 +1048,16 @@ int runRealtime(
                                     if (cheatsEnabledAtomic.load(std::memory_order_relaxed) && !cheats.empty()) {
                                         applyCheats(cheats, gb.bus());
                                     }
+                                    const std::uint32_t replayChecksum = frameChecksum(gb);
+                                    localFrameChecksums[rec.frame] = replayChecksum;
+                                    (void)netplayTransport.sendNetplayChecksum(rec.frame, replayChecksum);
                                 }
                                 (void)gb.apu().takeSamples();
                                 audioRing.clear();
                                 if (audioEnabled) {
                                     SDL_ClearQueuedAudio(audioDev);
                                 }
+                                ++netplayRollbackCount;
                                 uiMessage = "NETPLAY ROLLBACK";
                                 uiMessageFrames = 90;
                             }
@@ -1140,6 +1219,20 @@ int runRealtime(
         }
         uiMessageFrames = 120;
     };
+    const auto persistNetworkConfig = [&]() {
+        NetworkFrontendConfig cfg{};
+        const int delay = std::clamp(netplayDelayAtomic.load(std::memory_order_relaxed), 0, 10);
+        cfg.netplayDelayFrames = delay;
+        cfg.linkMode = 0;
+        if (linkCableMode == LinkCableMode::Loopback) {
+            cfg.linkMode = 1;
+        } else if (linkCableMode == LinkCableMode::Noise) {
+            cfg.linkMode = 2;
+        } else if (linkCableMode == LinkCableMode::Socket) {
+            cfg.linkMode = 3;
+        }
+        return saveNetworkFrontendConfig(networkConfigPath, cfg);
+    };
     const auto openControlsMenuState = [&]() {
         showControlsMenu = true;
         controlsAwaitKey = false;
@@ -1173,6 +1266,7 @@ int runRealtime(
         }
         uiMessage = linkCableUiName(linkCableMode);
         uiMessageFrames = 120;
+        (void)persistNetworkConfig();
     };
     const auto dispatchTopMenuAction = [&](TopMenuAction action) {
         switch (action) {
@@ -1270,6 +1364,7 @@ int runRealtime(
             const int current = netplayDelayAtomic.load(std::memory_order_relaxed);
             const int next = std::max(0, current - 1);
             netplayDelayAtomic.store(next, std::memory_order_relaxed);
+            (void)persistNetworkConfig();
             uiMessage = "NETPLAY DELAY " + std::to_string(next);
             uiMessageFrames = 120;
             break;
@@ -1283,6 +1378,7 @@ int runRealtime(
             const int current = netplayDelayAtomic.load(std::memory_order_relaxed);
             const int next = std::min(10, current + 1);
             netplayDelayAtomic.store(next, std::memory_order_relaxed);
+            (void)persistNetworkConfig();
             uiMessage = "NETPLAY DELAY " + std::to_string(next);
             uiMessageFrames = 120;
             break;
@@ -1572,6 +1668,8 @@ int runRealtime(
             char msg[48];
             if (pendingPause == 1) {
                 std::snprintf(msg, sizeof(msg), "WATCH HIT %04X", addr);
+            } else if (pendingPause == 3) {
+                std::snprintf(msg, sizeof(msg), "NETPLAY DESYNC");
             } else {
                 std::snprintf(msg, sizeof(msg), "BP HIT %04X", addr);
             }
@@ -2454,15 +2552,31 @@ int runRealtime(
             --uiMessageFrames;
         }
         char statusLine[84];
-        std::snprintf(
-            statusLine,
-            sizeof(statusLine),
-            "%s %s%s%s",
-            linkCableUiName(linkCableMode),
-            filterUiName(filterMode),
-            watchpointEnabled ? " WP" : "",
-            fastForward ? " FF" : ""
-        );
+        if (netplayEnabled) {
+            std::snprintf(
+                statusLine,
+                sizeof(statusLine),
+                "%s %s NP:D%d P%llu R%llu X%llu%s%s",
+                linkCableUiName(linkCableMode),
+                filterUiName(filterMode),
+                std::clamp(netplayDelayAtomic.load(std::memory_order_relaxed), 0, 10),
+                static_cast<unsigned long long>(netplayPredictedCount),
+                static_cast<unsigned long long>(netplayRollbackCount),
+                static_cast<unsigned long long>(netplayDesyncCount),
+                watchpointEnabled ? " WP" : "",
+                fastForward ? " FF" : ""
+            );
+        } else {
+            std::snprintf(
+                statusLine,
+                sizeof(statusLine),
+                "%s %s%s%s",
+                linkCableUiName(linkCableMode),
+                filterUiName(filterMode),
+                watchpointEnabled ? " WP" : "",
+                fastForward ? " FF" : ""
+            );
+        }
         drawHexText(
             renderer,
             blit.gameDst.x + 12,
@@ -2574,6 +2688,7 @@ int runRealtime(
     }
     savePalettePreference(palettePath, paletteMode);
     saveFilterPreference(filtersPath, filterMode);
+    (void)persistNetworkConfig();
 
     return backToMenu ? 2 : 0;
 }

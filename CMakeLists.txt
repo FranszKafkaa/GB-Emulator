@@ -13,6 +13,7 @@ add_library(gbcore
     src/core/cartridge.cpp
     src/core/cartridge/mappers/no_mbc.cpp
     src/core/cartridge/mappers/mbc1.cpp
+    src/core/cartridge/mappers/mmm01.cpp
     src/core/cartridge/mappers/mbc2.cpp
     src/core/cartridge/mappers/mbc3.cpp
     src/core/cartridge/mappers/mbc5.cpp
@@ -47,6 +48,7 @@ add_executable(gbemu
     src/app/frontend/realtime/replay_io.cpp
     src/app/frontend/realtime/control_bindings.cpp
     src/app/frontend/realtime/link_transport.cpp
+    src/app/frontend/realtime/network_config.cpp
     src/app/frontend/realtime/top_menu.cpp
     src/app/frontend/realtime.cpp
     src/app/frontend/rom_selector.cpp
@@ -82,6 +84,7 @@ if (BUILD_TESTING)
         src/app/frontend/realtime/replay_io.cpp
         src/app/frontend/realtime/control_bindings.cpp
         src/app/frontend/realtime/link_transport.cpp
+        src/app/frontend/realtime/network_config.cpp
         src/app/frontend/realtime/frame_timeline.cpp
         src/app/frontend/realtime/top_menu.cpp
         tests/test_main.cpp
