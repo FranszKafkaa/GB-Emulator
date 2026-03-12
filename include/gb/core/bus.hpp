@@ -44,6 +44,8 @@ public:
         u8 serialSb = 0x00;
         u8 serialSc = 0x7E;
         bool serialTransferRequested = false;
+        bool serialTransferInProgress = false;
+        u32 serialTransferCycles = 0;
         bool bootRomEnabled = false;
         u8 ie = 0;
         u8 iflag = 0xE1;
@@ -137,6 +139,8 @@ private:
     u8 serialSb_ = 0x00;
     u8 serialSc_ = 0x7E;
     bool serialTransferRequested_ = false;
+    bool serialTransferInProgress_ = false;
+    u32 serialTransferCycles_ = 0;
     std::vector<u8> bootRom_{};
     bool bootRomEnabled_ = false;
 

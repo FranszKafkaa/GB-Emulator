@@ -277,10 +277,6 @@ bool Cartridge::loadRtcFromFile(const std::string& path) {
         }
     }
 
-    const std::vector<u8> current = mapper_->state();
-    if (payload.size() != current.size()) {
-        return false;
-    }
     mapper_->loadState(payload);
     return true;
 }

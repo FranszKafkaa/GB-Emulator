@@ -2,17 +2,21 @@
 #include "common.hpp"
 
 #include <chrono>
+#include <cstdint>
 
 namespace gb {
 namespace cartridge_mapper {
 namespace {
 
+std::int64_t currentUnixSeconds() {
+    const auto now = std::chrono::system_clock::now();
+    return std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+}
+
 class MBC3Mapper final : public Mapper {
 public:
     MBC3Mapper(std::vector<u8>& rom, std::vector<u8>& ram)
-        : rom_(rom), ram_(ram), romBankCount_(safeRomBankCount(rom)), ramBankCount_(safeRamBankCount(ram)) {
-        lastUpdate_ = std::chrono::steady_clock::now();
-    }
+        : rom_(rom), ram_(ram), romBankCount_(safeRomBankCount(rom)), ramBankCount_(safeRamBankCount(ram)) {}
 
     u8 read(u16 address) const override {
         const_cast<MBC3Mapper*>(this)->updateRtc();
@@ -107,7 +111,7 @@ public:
     }
 
     [[nodiscard]] std::vector<u8> state() const override {
-        return std::vector<u8>{
+        std::vector<u8> out{
             romBank_,
             select_,
             static_cast<u8>(ramRtcEnabled_ ? 1 : 0),
@@ -124,6 +128,11 @@ public:
             latchedRtc_.dayLow,
             latchedRtc_.dayHigh,
         };
+        const std::int64_t unixSeconds = lastUnixSeconds_ == 0 ? currentUnixSeconds() : lastUnixSeconds_;
+        for (int i = 0; i < 8; ++i) {
+            out.push_back(static_cast<u8>((static_cast<std::uint64_t>(unixSeconds) >> (i * 8)) & 0xFF));
+        }
+        return out;
     }
 
     void loadState(const std::vector<u8>& s) override {
@@ -148,7 +157,18 @@ public:
         latchedRtc_.hours = static_cast<u8>(s[12] % 24);
         latchedRtc_.dayLow = s[13];
         latchedRtc_.dayHigh = static_cast<u8>(s[14] & 0xC1);
-        lastUpdate_ = std::chrono::steady_clock::now();
+
+        if (s.size() >= 23) {
+            std::uint64_t packed = 0;
+            for (int i = 0; i < 8; ++i) {
+                packed |= static_cast<std::uint64_t>(s[15 + i]) << (i * 8);
+            }
+            lastUnixSeconds_ = static_cast<std::int64_t>(packed);
+        } else {
+            lastUnixSeconds_ = currentUnixSeconds();
+        }
+
+        updateRtc();
     }
 
 private:
@@ -183,12 +203,21 @@ private:
     }
 
     void updateRtc() {
-        const auto now = std::chrono::steady_clock::now();
-        const auto delta = std::chrono::duration_cast<std::chrono::seconds>(now - lastUpdate_).count();
+        const std::int64_t now = currentUnixSeconds();
+        if (lastUnixSeconds_ == 0) {
+            lastUnixSeconds_ = now;
+            return;
+        }
+        if (now < lastUnixSeconds_) {
+            lastUnixSeconds_ = now;
+            return;
+        }
+
+        const std::int64_t delta = now - lastUnixSeconds_;
         if (delta <= 0) {
             return;
         }
-        lastUpdate_ = now;
+        lastUnixSeconds_ = now;
 
         const bool halted = (rtc_.dayHigh & 0x40) != 0;
         if (halted) {
@@ -235,7 +264,7 @@ private:
 
     RtcRegs rtc_{};
     RtcRegs latchedRtc_{};
-    std::chrono::steady_clock::time_point lastUpdate_{};
+    std::int64_t lastUnixSeconds_ = currentUnixSeconds();
 };
 
 } // namespace

@@ -186,6 +186,18 @@ bool parseAppOptions(int argc, char** argv, AppOptions& outOptions, std::string&
             }
             continue;
         }
+        if (arg == "--netplay-delay") {
+            if (!readIntArg(argc, argv, i, arg, options.netplayDelayFrames, errorMessage)) {
+                return false;
+            }
+            if (options.netplayDelayFrames < 0) {
+                options.netplayDelayFrames = 0;
+            }
+            if (options.netplayDelayFrames > 10) {
+                options.netplayDelayFrames = 10;
+            }
+            continue;
+        }
 
         if (!arg.empty() && arg[0] != '-' && options.romPath.empty()) {
             options.romPath = arg;

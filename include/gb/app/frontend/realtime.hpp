@@ -24,7 +24,8 @@ int runRealtime(
     const std::string& linkConnect,
     int linkHostPort,
     const std::string& netplayConnect,
-    int netplayHostPort
+    int netplayHostPort,
+    int netplayDelayFrames
 );
 
 } // namespace gb::frontend

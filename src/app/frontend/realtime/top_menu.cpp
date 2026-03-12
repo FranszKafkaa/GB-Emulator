@@ -23,6 +23,7 @@ constexpr std::array<const char*, static_cast<std::size_t>(TopMenuSection::Count
     "IMAGEM",
     "DEBUG",
     "CONTROLES",
+    "REDE",
 };
 
 const std::vector<TopMenuItem> kSessionItems{
@@ -51,6 +52,12 @@ const std::vector<TopMenuItem> kDebugItems{
 
 const std::vector<TopMenuItem> kControlsItems{
     {TopMenuAction::OpenControlsMenu, "ABRIR MENU F11"},
+};
+
+const std::vector<TopMenuItem> kNetworkItems{
+    {TopMenuAction::CycleLinkMode, "CICLAR LINK"},
+    {TopMenuAction::NetplayDelayDown, "DELAY NETPLAY -"},
+    {TopMenuAction::NetplayDelayUp, "DELAY NETPLAY +"},
 };
 
 std::size_t sectionIndex(TopMenuSection section) {
@@ -100,7 +107,8 @@ const std::vector<TopMenuItem>& topMenuItems(TopMenuSection section) {
     case TopMenuSection::Session: return kSessionItems;
     case TopMenuSection::Image: return kImageItems;
     case TopMenuSection::Debug: return kDebugItems;
-    default: return kControlsItems;
+    case TopMenuSection::Controls: return kControlsItems;
+    default: return kNetworkItems;
     }
 }
 

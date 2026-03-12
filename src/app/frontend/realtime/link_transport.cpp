@@ -1,6 +1,7 @@
 #include "gb/app/frontend/realtime/link_transport.hpp"
 
 #include <array>
+#include <algorithm>
 #include <cstring>
 
 #ifdef __unix__
@@ -147,6 +148,36 @@ bool UdpLinkTransport::exchangeNetplayInput(
     remoteInput = lastRemoteInput_;
     predicted = true;
     return true;
+}
+
+void UdpLinkTransport::pump() {
+    if (!isOpen()) {
+        return;
+    }
+    drainIncoming();
+}
+
+bool UdpLinkTransport::takeNetplayInput(std::uint64_t frame, std::uint8_t& value) {
+    const auto it = netplayInputs_.find(frame);
+    if (it == netplayInputs_.end()) {
+        return false;
+    }
+    value = it->second;
+    netplayInputs_.erase(it);
+    return true;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint8_t>> UdpLinkTransport::takeAllNetplayInputs() {
+    std::vector<std::pair<std::uint64_t, std::uint8_t>> out;
+    out.reserve(netplayInputs_.size());
+    for (const auto& entry : netplayInputs_) {
+        out.emplace_back(entry.first, entry.second);
+    }
+    netplayInputs_.clear();
+    std::sort(out.begin(), out.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.first < rhs.first;
+    });
+    return out;
 }
 
 bool UdpLinkTransport::openSocket(std::uint16_t localPort) {

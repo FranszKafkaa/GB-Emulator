@@ -129,7 +129,8 @@ int runRealtimeFlow(gb::AppOptions& options) {
             options.linkConnect,
             options.linkHostPort,
             options.netplayConnect,
-            options.netplayHostPort
+            options.netplayHostPort,
+            options.netplayDelayFrames
         );
 
         if (rc == 2) {

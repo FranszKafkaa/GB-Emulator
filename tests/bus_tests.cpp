@@ -301,6 +301,10 @@ TEST_CASE("bus", "serial_transfer_request_and_completion_flow") {
     gb.bus().write(0xFF02, 0x81);
 
     gb::u8 outData = 0;
+    T_REQUIRE(!gb.bus().consumeSerialTransfer(outData));
+    gb.bus().tick(4095);
+    T_REQUIRE(!gb.bus().consumeSerialTransfer(outData));
+    gb.bus().tick(1);
     T_REQUIRE(gb.bus().consumeSerialTransfer(outData));
     T_EQ(outData, 0xA5);
     T_REQUIRE(!gb.bus().consumeSerialTransfer(outData));
@@ -318,6 +322,7 @@ TEST_CASE("bus", "serial_state_roundtrip_restores_pending_transfer") {
 
     gb.bus().write(0xFF01, 0xC3);
     gb.bus().write(0xFF02, 0x81);
+    gb.bus().tick(3000);
     const auto saved = gb.bus().state();
 
     gb.bus().write(0xFF01, 0x00);
@@ -325,8 +330,26 @@ TEST_CASE("bus", "serial_state_roundtrip_restores_pending_transfer") {
     gb.bus().loadState(saved);
 
     gb::u8 outData = 0;
+    T_REQUIRE(!gb.bus().consumeSerialTransfer(outData));
+    gb.bus().tick(1096);
     T_REQUIRE(gb.bus().consumeSerialTransfer(outData));
     T_EQ(outData, 0xC3);
+}
+
+TEST_CASE("bus", "serial_cgb_fast_mode_finishes_faster") {
+    gb::GameBoy gb;
+    tests::ScopedPath cleanup;
+    loadBlankRom(gb, cleanup, true);
+
+    gb.bus().write(0xFF01, 0x66);
+    gb.bus().write(0xFF02, 0x83); // start + internal clock + fast mode
+
+    gb::u8 outData = 0;
+    gb.bus().tick(127);
+    T_REQUIRE(!gb.bus().consumeSerialTransfer(outData));
+    gb.bus().tick(1);
+    T_REQUIRE(gb.bus().consumeSerialTransfer(outData));
+    T_EQ(outData, 0x66);
 }
 
 TEST_CASE("bus", "boot_rom_overrides_cartridge_until_ff50") {

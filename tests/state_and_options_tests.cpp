@@ -1,6 +1,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -200,6 +201,57 @@ TEST_CASE("state", "rtc_roundtrip_file_via_gameboy") {
     T_EQ(reader.bus().read(0xA000), 0x1C);
 }
 
+TEST_CASE("state", "rtc_file_applies_offline_elapsed_time_for_mbc3") {
+    tests::RomSpec spec{};
+    spec.name = "state_rtc_offline_elapsed";
+    spec.cartridgeType = 0x10;
+    spec.ramCode = 0x03;
+    spec.program = {0x76};
+
+    gb::GameBoy writer;
+    tests::ScopedPath cleanupWriter;
+    loadRomOrThrow(writer, spec, cleanupWriter);
+
+    writer.bus().write(0x0000, 0x0A);
+    writer.bus().write(0x4000, 0x08);
+    writer.bus().write(0xA000, 0x00); // seconds
+    writer.bus().write(0x4000, 0x09);
+    writer.bus().write(0xA000, 0x00); // minutes
+    writer.bus().write(0x4000, 0x0A);
+    writer.bus().write(0xA000, 0x00); // hours
+    writer.bus().write(0x4000, 0x0B);
+    writer.bus().write(0xA000, 0x00); // day low
+    writer.bus().write(0x4000, 0x0C);
+    writer.bus().write(0xA000, 0x00); // day high
+
+    const auto rtcPath = tests::makeTempPath("state_rtc_offline", ".rtc");
+    tests::ScopedPath cleanupRtc(rtcPath);
+    T_REQUIRE(writer.saveRtcToFile(rtcPath.string()));
+
+    auto rtcFile = tests::readBinaryFile(rtcPath);
+    T_REQUIRE(rtcFile.size() >= static_cast<std::size_t>(13 + 23));
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+    const std::uint64_t past = static_cast<std::uint64_t>(now - 65);
+    const std::size_t tsOffset = 13 + 15;
+    for (int i = 0; i < 8; ++i) {
+        rtcFile[tsOffset + static_cast<std::size_t>(i)] = static_cast<gb::u8>((past >> (i * 8)) & 0xFF);
+    }
+    T_REQUIRE(tests::writeBinaryFile(rtcPath, rtcFile));
+
+    gb::GameBoy reader;
+    tests::ScopedPath cleanupReader;
+    loadRomOrThrow(reader, spec, cleanupReader);
+    T_REQUIRE(reader.loadRtcFromFile(rtcPath.string()));
+    reader.bus().write(0x0000, 0x0A);
+    reader.bus().write(0x4000, 0x08);
+    reader.bus().write(0x6000, 0x00);
+    reader.bus().write(0x6000, 0x01);
+    const gb::u8 seconds = reader.bus().read(0xA000);
+    T_REQUIRE(seconds >= 4 && seconds <= 8);
+}
+
 TEST_CASE("state", "boot_rom_file_maps_until_ff50_disable") {
     tests::RomSpec spec{};
     spec.name = "boot_rom_mapping";
@@ -262,6 +314,7 @@ TEST_CASE("options", "defaults_when_no_args") {
     T_EQ(options.netplayConnect, std::string(""));
     T_EQ(options.linkHostPort, 0);
     T_EQ(options.netplayHostPort, 0);
+    T_EQ(options.netplayDelayFrames, 0);
     T_EQ(options.frames, 120);
     T_EQ(options.scale, 4);
     T_EQ(options.audioBuffer, 1024);
@@ -419,9 +472,21 @@ TEST_CASE("options", "netplay_flags_parse") {
     gb::AppOptions options;
     std::string error;
 
-    T_REQUIRE(parseArgs({"gbemu", "--netplay-host", "6100", "--netplay-connect", "10.0.0.2:6100"}, options, error));
+    T_REQUIRE(parseArgs({"gbemu", "--netplay-host", "6100", "--netplay-connect", "10.0.0.2:6100", "--netplay-delay", "3"}, options, error));
     T_EQ(options.netplayHostPort, 6100);
     T_EQ(options.netplayConnect, std::string("10.0.0.2:6100"));
+    T_EQ(options.netplayDelayFrames, 3);
+}
+
+TEST_CASE("options", "netplay_delay_is_clamped") {
+    gb::AppOptions options;
+    std::string error;
+
+    T_REQUIRE(parseArgs({"gbemu", "--netplay-delay", "-4"}, options, error));
+    T_EQ(options.netplayDelayFrames, 0);
+
+    T_REQUIRE(parseArgs({"gbemu", "--netplay-delay", "99"}, options, error));
+    T_EQ(options.netplayDelayFrames, 10);
 }
 
 TEST_CASE("options", "invalid_numeric_argument_returns_false") {

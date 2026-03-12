@@ -2,8 +2,10 @@
 
 #include <cstdint>
 #include <optional>
+#include <utility>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #ifdef __unix__
 #include <sys/socket.h>
@@ -33,6 +35,9 @@ public:
     // Lockstep base: envia input local do frame e tenta receber input remoto.
     // Quando nao chega a tempo, retorna ultimo input remoto e marca predicted=true.
     bool exchangeNetplayInput(std::uint64_t frame, std::uint8_t localInput, std::uint8_t& remoteInput, bool& predicted);
+    void pump();
+    [[nodiscard]] bool takeNetplayInput(std::uint64_t frame, std::uint8_t& value);
+    [[nodiscard]] std::vector<std::pair<std::uint64_t, std::uint8_t>> takeAllNetplayInputs();
 
 private:
     bool openSocket(std::uint16_t localPort);

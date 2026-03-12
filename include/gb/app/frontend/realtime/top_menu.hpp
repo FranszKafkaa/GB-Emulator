@@ -17,7 +17,8 @@ enum class TopMenuSection : int {
     Image = 1,
     Debug = 2,
     Controls = 3,
-    Count = 4,
+    Network = 4,
+    Count = 5,
 };
 
 enum class TopMenuAction : int {
@@ -38,6 +39,9 @@ enum class TopMenuAction : int {
     ToggleBreakpointMenu,
     ToggleSearchPanel,
     OpenControlsMenu,
+    CycleLinkMode,
+    NetplayDelayDown,
+    NetplayDelayUp,
 };
 
 struct TopMenuItem {

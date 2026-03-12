@@ -23,7 +23,7 @@ Detalhe tecnico:
 - o rewind interno foi otimizado para evitar travadas: saiu de `vector` com `erase(begin)` para fila com `pop_front` O(1)
 - `runFrame` em modo de timing preciso ganhou guarda de ciclos para evitar loop infinito quando LCD estiver desligado
 - tecla `F11` abre menu de remapeamento de controles (teclado e controle) com salvamento em arquivo
-- barra superior no SDL virou menu clicavel por secoes (`SESSAO`, `IMAGEM`, `DEBUG`, `CONTROLES`)
+- barra superior no SDL virou menu clicavel por secoes (`SESSAO`, `IMAGEM`, `DEBUG`, `CONTROLES`, `REDE`)
 - tecla `F3` agora mostra/oculta a barra superior
 - itens da barra ficaram dinamicos por disponibilidade e com highlight de hover no mouse
 - menus pop-up agora tem botao `X` clicavel para fechar (`Escala`, `Paleta`, `Controles`)
@@ -32,6 +32,9 @@ Detalhe tecnico:
 - HDMA CGB no `FF55` foi ajustado: modo geral continua imediato, modo H-Blank agora transfere 16 bytes por H-Blank
 - linha de comando ganhou `--hardware auto|dmg|cgb` para ROM dual-mode
 - `GameBoy` agora permite alternar o hardware emulado (DMG/CGB) em tempo de carga da ROM
+- RTC de MBC3/HuC3 agora usa relogio real (`system_clock`) e compensa tempo offline ao reabrir
+- serial/link agora respeita tempo de transferencia por byte (normal e fast mode CGB)
+- netplay ganhou `--netplay-delay` e rollback simples quando input remoto atrasado diverge da previsao
 
 Impacto:
 
@@ -47,6 +50,9 @@ Impacto:
 - melhora fidelidade de audio em jogos que usam ruido/percussao (canal 4)
 - melhora compatibilidade CGB em jogos que dependem de HDMA por H-Blank
 - permite testar ROM dual-mode em DMG real sem precisar trocar de build
+- melhora confiabilidade de eventos dependentes de relogio em jogos com RTC
+- melhora compatibilidade de jogos que esperam interrupcao serial em janela temporal mais fiel
+- reduz dessync visual em netplay sob jitter com re-simulacao automatica
 
 ## 0. Como ler este guia
 
@@ -157,6 +163,7 @@ Opcoes:
 - `--scale <n>`: escala base da janela no modo janela.
 - `--audio-buffer <256..8192>`: buffer solicitado para SDL audio.
 - `--hardware <auto|dmg|cgb>`: seleciona o hardware emulado para ROM dual-mode.
+- `--netplay-delay <0..10>`: atraso de entrada para netplay com rollback simples.
 
 Tambem aceita ROM como argumento posicional:
 
@@ -175,7 +182,7 @@ Para cada ROM, o projeto usa um nome base (`stem`) e grava em `states/`:
 
 - `.state`: save state completo do emulador
 - `.sav`: save interno do cartucho (bateria)
-- `.rtc`: estado de relogio (MBC3/HuC3)
+- `.rtc`: estado de relogio (MBC3/HuC3) + timestamp real para compensar tempo offline
 - `.palette`: preferencia da paleta visual
 - `.filters`: preferencia de filtro visual
 - `.controls`, `.cheats`, `.replay`: reservados
@@ -651,6 +658,7 @@ Durante a sessao SDL existe uma barra no topo com secoes clicaveis:
 - `IMAGEM`: fullscreen, escala, paleta, filtro, captura
 - `DEBUG`: debug panel, BP/WP, busca de memoria
 - `CONTROLES`: abrir menu de remapeamento
+- `REDE`: modo do link cable e ajuste de delay do netplay em tempo real
 
 Comportamento:
 

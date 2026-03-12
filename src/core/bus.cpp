@@ -46,6 +46,8 @@ constexpr u16 InterruptFlag = 0xFF0F;
 constexpr u16 HramBegin = 0xFF80;
 constexpr u16 HramEnd = 0xFFFE;
 constexpr u16 InterruptEnable = 0xFFFF;
+constexpr u32 SerialCyclesPerTransferNormal = 512u * 8u; // 8192 Hz, 8 bits
+constexpr u32 SerialCyclesPerTransferFast = 16u * 8u;    // CGB fast mode, 8 bits
 
 [[nodiscard]] bool inRange(u16 value, u16 begin, u16 end) {
     return value >= begin && value <= end;
@@ -288,7 +290,20 @@ void Bus::write(u16 address, u8 value) {
     case SerialSc:
         serialSc_ = static_cast<u8>(0x7C | (value & 0x83));
         if ((value & 0x80) != 0) {
-            serialTransferRequested_ = true;
+            serialTransferRequested_ = false;
+            serialTransferInProgress_ = true;
+            const bool internalClock = (serialSc_ & 0x01) != 0;
+            const bool cgbFast = cgbMode_ && ((serialSc_ & 0x02) != 0);
+            if (!internalClock) {
+                // Modo externo: fallback para tempo classico quando nao ha clock remoto dedicado.
+                serialTransferCycles_ = SerialCyclesPerTransferNormal;
+            } else {
+                serialTransferCycles_ = cgbFast ? SerialCyclesPerTransferFast : SerialCyclesPerTransferNormal;
+            }
+        } else {
+            serialTransferInProgress_ = false;
+            serialTransferCycles_ = 0;
+            serialTransferRequested_ = false;
         }
         return;
     case TimerDiv:
@@ -448,6 +463,15 @@ void Bus::tick(u32 cycles) {
     timer_.tick(cycles);
     ppu_.tick(cycles, vram_, vramBank1_, oam_, cgbMode_, bgPalette_, objPalette_);
     tickHdmaHBlank();
+    if (serialTransferInProgress_) {
+        if (cycles >= serialTransferCycles_) {
+            serialTransferCycles_ = 0;
+            serialTransferInProgress_ = false;
+            serialTransferRequested_ = true;
+        } else {
+            serialTransferCycles_ -= cycles;
+        }
+    }
     apu_.tick(cycles);
 
     if (timer_.consumeInterrupt()) {
@@ -496,6 +520,8 @@ bool Bus::consumeSerialTransfer(u8& outData) {
 void Bus::completeSerialTransfer(u8 inData) {
     serialSb_ = inData;
     serialSc_ = static_cast<u8>(serialSc_ & ~0x80);
+    serialTransferInProgress_ = false;
+    serialTransferCycles_ = 0;
     requestInterrupt(3);
 }
 
@@ -575,6 +601,8 @@ Bus::State Bus::state() const {
     s.serialSb = serialSb_;
     s.serialSc = serialSc_;
     s.serialTransferRequested = serialTransferRequested_;
+    s.serialTransferInProgress = serialTransferInProgress_;
+    s.serialTransferCycles = serialTransferCycles_;
     s.bootRomEnabled = bootRomEnabled_;
     s.ie = ie_;
     s.iflag = if_;
@@ -610,6 +638,8 @@ void Bus::loadState(const State& s) {
     serialSb_ = s.serialSb;
     serialSc_ = s.serialSc;
     serialTransferRequested_ = s.serialTransferRequested;
+    serialTransferInProgress_ = s.serialTransferInProgress;
+    serialTransferCycles_ = s.serialTransferCycles;
     bootRomEnabled_ = s.bootRomEnabled && !bootRom_.empty();
     ie_ = s.ie;
     if_ = s.iflag;

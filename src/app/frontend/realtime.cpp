@@ -6,13 +6,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <random>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "gb/app/frontend/realtime/cheat_engine.hpp"
@@ -54,7 +57,8 @@ int runRealtime(
     const std::string& linkConnect,
     int linkHostPort,
     const std::string& netplayConnect,
-    int netplayHostPort
+    int netplayHostPort,
+    int netplayDelayFrames
 ) {
     SDL_SetHint(SDL_HINT_RENDER_VSYNC, "1");
     SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
@@ -212,6 +216,22 @@ int runRealtime(
             netplayEnabled = netplayTransport.openClient(ep->host, ep->port);
         }
     }
+    struct NetplayFrameRecord {
+        std::uint64_t frame = 0;
+        gb::GameBoy::SaveState preState{};
+        std::uint8_t localInput = 0;
+        std::uint8_t remoteInput = 0;
+        bool predicted = false;
+    };
+    constexpr std::size_t kNetplayHistoryLimit = 180;
+    const int initialNetplayDelay = std::clamp(netplayDelayFrames, 0, 10);
+    std::atomic<int> netplayDelayAtomic{initialNetplayDelay};
+    std::deque<std::uint8_t> localInputDelayQueue{};
+    for (int i = 0; i < initialNetplayDelay; ++i) {
+        localInputDelayQueue.push_back(0);
+    }
+    std::deque<NetplayFrameRecord> netplayHistory{};
+    std::unordered_map<std::uint64_t, std::uint8_t> netplayAuthoritativeInputs{};
     if (socketLinkAvailable) {
         linkCableMode = LinkCableMode::Socket;
     }
@@ -779,13 +799,58 @@ int runRealtime(
 
                 {
                     std::lock_guard<std::mutex> gbLock(gbMutex);
+                    const auto processSerialTransferLocked = [&]() {
+                        gb::u8 outData = 0;
+                        while (gb.bus().consumeSerialTransfer(outData)) {
+                            gb::u8 inData = 0xFF;
+                            const auto mode = static_cast<LinkCableMode>(linkCableModeAtomic.load(std::memory_order_relaxed));
+                            if (mode == LinkCableMode::Loopback) {
+                                inData = outData;
+                            } else if (mode == LinkCableMode::Noise) {
+                                inData = static_cast<gb::u8>(emuRandByte(emuRng));
+                            } else if (mode == LinkCableMode::Socket) {
+                                std::uint8_t remote = 0xFF;
+                                if (linkTransport.exchangeSerialByte(outData, remote)) {
+                                    inData = static_cast<gb::u8>(remote);
+                                }
+                            }
+                            gb.bus().completeSerialTransfer(inData);
+                        }
+                    };
+                    const auto runOneFrameLocked = [&]() {
+                        if (gb.preciseTiming()) {
+                            bool seenVblank = false;
+                            gb::u32 elapsed = 0;
+                            constexpr gb::u32 kMaxGuardCycles = 70224u * 3u;
+                            while (elapsed < kMaxGuardCycles) {
+                                elapsed += gb.step();
+                                processSerialTransferLocked();
+                                const gb::u8 ly = gb.bus().peek(0xFF44);
+                                if (!seenVblank && ly >= 144) {
+                                    seenVblank = true;
+                                } else if (seenVblank && ly < 144) {
+                                    break;
+                                }
+                            }
+                            return;
+                        }
+                        gb::u32 elapsed = 0;
+                        constexpr gb::u32 kFrameCycles = 70224u;
+                        while (elapsed < kFrameCycles) {
+                            elapsed += gb.step();
+                            processSerialTransferLocked();
+                        }
+                    };
+
                     if (watchEnabled) {
                         watchBefore = gb.bus().peek(watchAddr);
                     }
 
                     const std::uint64_t frameId = emulatedFrameCounter.load(std::memory_order_relaxed);
                     std::uint8_t localInputMask = joypadMaskFromState(gb.joypad().state());
+                    std::uint8_t localAppliedMask = localInputMask;
                     bool replayPlayingNow = false;
+                    std::optional<NetplayFrameRecord> netplayFrameRecord;
                     {
                         std::lock_guard<std::mutex> replayLock(replayMutex);
                         replayPlayingNow = replayPlaying;
@@ -799,18 +864,125 @@ int runRealtime(
                         }
                     }
                     if (netplayEnabled && !replayPlayingNow) {
+                        const int desiredDelay = std::clamp(
+                            netplayDelayAtomic.load(std::memory_order_relaxed),
+                            0,
+                            10
+                        );
+                        while (static_cast<int>(localInputDelayQueue.size()) < desiredDelay) {
+                            localInputDelayQueue.push_back(0);
+                        }
+                        while (static_cast<int>(localInputDelayQueue.size()) > desiredDelay) {
+                            localInputDelayQueue.pop_front();
+                        }
+
+                        if (desiredDelay > 0) {
+                            localInputDelayQueue.push_back(localInputMask);
+                            localAppliedMask = localInputDelayQueue.front();
+                            localInputDelayQueue.pop_front();
+                        } else {
+                            localAppliedMask = localInputMask;
+                        }
+
                         std::uint8_t remoteMask = 0;
                         bool predicted = false;
-                        if (netplayTransport.exchangeNetplayInput(frameId, localInputMask, remoteMask, predicted)) {
-                            applyJoypadMask(gb.joypad(), static_cast<std::uint8_t>(localInputMask | remoteMask));
+                        const auto authIt = netplayAuthoritativeInputs.find(frameId);
+                        if (authIt != netplayAuthoritativeInputs.end()) {
+                            remoteMask = authIt->second;
+                            predicted = false;
+                            netplayAuthoritativeInputs.erase(authIt);
+                            std::uint8_t ignoredRemote = 0;
+                            bool ignoredPredicted = false;
+                            (void)netplayTransport.exchangeNetplayInput(
+                                frameId,
+                                localAppliedMask,
+                                ignoredRemote,
+                                ignoredPredicted
+                            );
+                        } else {
+                            (void)netplayTransport.exchangeNetplayInput(frameId, localAppliedMask, remoteMask, predicted);
                         }
+                        netplayFrameRecord = NetplayFrameRecord{
+                            frameId,
+                            gb.saveState(),
+                            localAppliedMask,
+                            remoteMask,
+                            predicted,
+                        };
+                        applyJoypadMask(gb.joypad(), static_cast<std::uint8_t>(localAppliedMask | remoteMask));
+                    } else {
+                        applyJoypadMask(gb.joypad(), localInputMask);
                     }
 
-                    gb.runFrame();
+                    runOneFrameLocked();
                     const std::uint64_t frameCount = emulatedFrameCounter.fetch_add(1, std::memory_order_relaxed) + 1;
 
                     if (cheatsEnabledAtomic.load(std::memory_order_relaxed) && !cheats.empty()) {
                         applyCheats(cheats, gb.bus());
+                    }
+
+                    if (netplayEnabled && !replayPlayingNow) {
+                        if (netplayFrameRecord.has_value()) {
+                            netplayHistory.push_back(std::move(netplayFrameRecord.value()));
+                            while (netplayHistory.size() > kNetplayHistoryLimit) {
+                                const std::uint64_t oldFrame = netplayHistory.front().frame;
+                                netplayHistory.pop_front();
+                                netplayAuthoritativeInputs.erase(oldFrame);
+                            }
+                        }
+
+                        netplayTransport.pump();
+                        const auto lateInputs = netplayTransport.takeAllNetplayInputs();
+                        std::optional<std::uint64_t> rollbackFrom{};
+                        for (const auto& late : lateInputs) {
+                            netplayAuthoritativeInputs[late.first] = late.second;
+                            for (const auto& rec : netplayHistory) {
+                                if (rec.frame != late.first) {
+                                    continue;
+                                }
+                                if (rec.predicted && rec.remoteInput != late.second) {
+                                    if (!rollbackFrom.has_value() || late.first < rollbackFrom.value()) {
+                                        rollbackFrom = late.first;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+
+                        if (rollbackFrom.has_value()) {
+                            std::size_t startIndex = 0;
+                            bool foundStart = false;
+                            for (std::size_t idx = 0; idx < netplayHistory.size(); ++idx) {
+                                if (netplayHistory[idx].frame == rollbackFrom.value()) {
+                                    startIndex = idx;
+                                    foundStart = true;
+                                    break;
+                                }
+                            }
+                            if (foundStart) {
+                                gb.loadState(netplayHistory[startIndex].preState);
+                                for (std::size_t idx = startIndex; idx < netplayHistory.size(); ++idx) {
+                                    auto& rec = netplayHistory[idx];
+                                    const auto it = netplayAuthoritativeInputs.find(rec.frame);
+                                    if (it != netplayAuthoritativeInputs.end()) {
+                                        rec.remoteInput = it->second;
+                                        rec.predicted = false;
+                                    }
+                                    applyJoypadMask(gb.joypad(), static_cast<std::uint8_t>(rec.localInput | rec.remoteInput));
+                                    runOneFrameLocked();
+                                    if (cheatsEnabledAtomic.load(std::memory_order_relaxed) && !cheats.empty()) {
+                                        applyCheats(cheats, gb.bus());
+                                    }
+                                }
+                                (void)gb.apu().takeSamples();
+                                audioRing.clear();
+                                if (audioEnabled) {
+                                    SDL_ClearQueuedAudio(audioDev);
+                                }
+                                uiMessage = "NETPLAY ROLLBACK";
+                                uiMessageFrames = 90;
+                            }
+                        }
                     }
 
                     {
@@ -818,23 +990,6 @@ int runRealtime(
                         if (replayRecording) {
                             replayData.frameInputs.push_back(joypadMaskFromState(gb.joypad().state()));
                         }
-                    }
-
-                    gb::u8 outData = 0;
-                    if (gb.bus().consumeSerialTransfer(outData)) {
-                        gb::u8 inData = 0xFF;
-                        const auto mode = static_cast<LinkCableMode>(linkCableModeAtomic.load(std::memory_order_relaxed));
-                        if (mode == LinkCableMode::Loopback) {
-                            inData = outData;
-                        } else if (mode == LinkCableMode::Noise) {
-                            inData = static_cast<gb::u8>(emuRandByte(emuRng));
-                        } else if (mode == LinkCableMode::Socket) {
-                            std::uint8_t remote = 0xFF;
-                            if (linkTransport.exchangeSerialByte(outData, remote)) {
-                                inData = static_cast<gb::u8>(remote);
-                            }
-                        }
-                        gb.bus().completeSerialTransfer(inData);
                     }
 
                     if (freezeEnabled && likelyWritableAddress(watchAddr)) {
@@ -1006,6 +1161,19 @@ int runRealtime(
         uiMessage = "CONTROLS MENU ON";
         uiMessageFrames = 90;
     };
+    const auto cycleLinkModeState = [&]() {
+        if (linkCableMode == LinkCableMode::Off) {
+            linkCableMode = LinkCableMode::Loopback;
+        } else if (linkCableMode == LinkCableMode::Loopback) {
+            linkCableMode = LinkCableMode::Noise;
+        } else if (linkCableMode == LinkCableMode::Noise) {
+            linkCableMode = socketLinkAvailable ? LinkCableMode::Socket : LinkCableMode::Off;
+        } else {
+            linkCableMode = LinkCableMode::Off;
+        }
+        uiMessage = linkCableUiName(linkCableMode);
+        uiMessageFrames = 120;
+    };
     const auto dispatchTopMenuAction = [&](TopMenuAction action) {
         switch (action) {
         case TopMenuAction::TogglePause:
@@ -1090,6 +1258,35 @@ int runRealtime(
         case TopMenuAction::OpenControlsMenu:
             openControlsMenuState();
             break;
+        case TopMenuAction::CycleLinkMode:
+            cycleLinkModeState();
+            break;
+        case TopMenuAction::NetplayDelayDown: {
+            if (!netplayEnabled) {
+                uiMessage = "NETPLAY OFF";
+                uiMessageFrames = 90;
+                break;
+            }
+            const int current = netplayDelayAtomic.load(std::memory_order_relaxed);
+            const int next = std::max(0, current - 1);
+            netplayDelayAtomic.store(next, std::memory_order_relaxed);
+            uiMessage = "NETPLAY DELAY " + std::to_string(next);
+            uiMessageFrames = 120;
+            break;
+        }
+        case TopMenuAction::NetplayDelayUp: {
+            if (!netplayEnabled) {
+                uiMessage = "NETPLAY OFF";
+                uiMessageFrames = 90;
+                break;
+            }
+            const int current = netplayDelayAtomic.load(std::memory_order_relaxed);
+            const int next = std::min(10, current + 1);
+            netplayDelayAtomic.store(next, std::memory_order_relaxed);
+            uiMessage = "NETPLAY DELAY " + std::to_string(next);
+            uiMessageFrames = 120;
+            break;
+        }
         default:
             break;
         }
@@ -1138,8 +1335,20 @@ int runRealtime(
             }
             break;
         case TopMenuSection::Controls:
-        default:
             out.push_back({TopMenuAction::OpenControlsMenu, "ABRIR MENU CONTROLES"});
+            break;
+        case TopMenuSection::Network:
+            out.push_back({TopMenuAction::CycleLinkMode, std::string("LINK ") + linkCableUiName(linkCableMode)});
+            if (netplayEnabled) {
+                const int delay = netplayDelayAtomic.load(std::memory_order_relaxed);
+                out.push_back({TopMenuAction::NetplayDelayDown, "DELAY NETPLAY -"});
+                out.push_back({TopMenuAction::NetplayDelayUp, "DELAY NETPLAY +"});
+                out.push_back({TopMenuAction::None, "ATUAL " + std::to_string(delay) + " FRAMES"});
+            } else {
+                out.push_back({TopMenuAction::None, "NETPLAY OFF"});
+            }
+            break;
+        default:
             break;
         }
         return out;
@@ -1693,17 +1902,7 @@ int runRealtime(
                 } else if (ev.key.keysym.sym == SDLK_d) {
                     toggleBreakpointPanelState();
                 } else if (ev.key.keysym.sym == SDLK_j) {
-                    if (linkCableMode == LinkCableMode::Off) {
-                        linkCableMode = LinkCableMode::Loopback;
-                    } else if (linkCableMode == LinkCableMode::Loopback) {
-                        linkCableMode = LinkCableMode::Noise;
-                    } else if (linkCableMode == LinkCableMode::Noise) {
-                        linkCableMode = socketLinkAvailable ? LinkCableMode::Socket : LinkCableMode::Off;
-                    } else {
-                        linkCableMode = LinkCableMode::Off;
-                    }
-                    uiMessage = linkCableUiName(linkCableMode);
-                    uiMessageFrames = 120;
+                    cycleLinkModeState();
                 } else if (ev.key.keysym.sym == SDLK_h) {
                     if (filterMode == VideoFilterMode::None) {
                         filterMode = VideoFilterMode::Scanline;

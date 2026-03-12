@@ -27,7 +27,8 @@ int runRealtime(
     const std::string& linkConnect,
     int linkHostPort,
     const std::string& netplayConnect,
-    int netplayHostPort
+    int netplayHostPort,
+    int netplayDelayFrames
 ) {
     return frontend::runRealtime(
         gb,
@@ -46,7 +47,8 @@ int runRealtime(
         linkConnect,
         linkHostPort,
         netplayConnect,
-        netplayHostPort
+        netplayHostPort,
+        netplayDelayFrames
     );
 }
 #endif

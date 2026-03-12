@@ -81,6 +81,19 @@ Regras:
 - ROM CGB-only ignora `--hardware dmg`
 - ROM sem suporte CGB ignora `--hardware cgb`
 
+### Netplay (UDP) e atraso configuravel
+
+```bash
+# host
+./build/gbemu --rom jogo.gb --netplay-host 6100 --netplay-delay 2
+
+# cliente
+./build/gbemu --rom jogo.gb --netplay-connect 127.0.0.1:6100 --netplay-delay 2
+```
+
+- `--netplay-delay <0..10>` ajusta atraso de entrada para estabilizar partidas com latencia.
+- quando um input remoto atrasado chega e diverge da previsao, o emulador aplica rollback simples.
+
 ## Estrutura esperada de ROMs (seletor SDL)
 
 O seletor procura primeiro em `./rom`, depois em `./roms`.
@@ -160,6 +173,7 @@ Durante o jogo, uma barra no topo mostra **secoes clicaveis**:
 - `IMAGEM`
 - `DEBUG`
 - `CONTROLES`
+- `REDE`
 
 Cada secao abre um dropdown com acoes (pause, mute, save/load, fullscreen, filtro, debug, etc.).
 
@@ -169,6 +183,11 @@ Comportamento da barra:
 - hover no mouse destaca secao e item
 - clique executa a acao
 - `F3` mostra/oculta a barra
+
+No menu `REDE`:
+
+- ciclar modo do link cable (equivalente a `J`)
+- ajustar delay do netplay em tempo real (`0..10` frames)
 
 ## Fechar janelas pop-up
 
@@ -192,7 +211,7 @@ Arquivos sao salvos em `./states/` por nome da ROM (`<rom>.ext`):
 
 - `.state`: save state
 - `.sav`: save interno do cartucho (battery RAM)
-- `.rtc`: relogio RTC (MBC3/HuC3)
+- `.rtc`: relogio RTC (MBC3/HuC3) com timestamp real para compensar tempo offline
 - `.palette`: preferencia de paleta
 - `.filters`: preferencia de filtro
 

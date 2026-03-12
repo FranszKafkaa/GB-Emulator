@@ -22,6 +22,7 @@ struct AppOptions {
     HardwareModePreference hardwareMode = HardwareModePreference::Auto;
     int linkHostPort = 0;
     int netplayHostPort = 0;
+    int netplayDelayFrames = 0;
     int frames = 120;
     int scale = 4;
     int audioBuffer = 1024;
