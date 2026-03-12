@@ -47,6 +47,7 @@ add_executable(gbemu
     src/app/frontend/realtime/replay_io.cpp
     src/app/frontend/realtime/control_bindings.cpp
     src/app/frontend/realtime/link_transport.cpp
+    src/app/frontend/realtime/top_menu.cpp
     src/app/frontend/realtime.cpp
     src/app/frontend/rom_selector.cpp
 )
@@ -82,6 +83,7 @@ if (BUILD_TESTING)
         src/app/frontend/realtime/control_bindings.cpp
         src/app/frontend/realtime/link_transport.cpp
         src/app/frontend/realtime/frame_timeline.cpp
+        src/app/frontend/realtime/top_menu.cpp
         tests/test_main.cpp
         tests/cpu_behavior_tests.cpp
         tests/cartridge_tests.cpp

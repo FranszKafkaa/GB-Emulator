@@ -1,10 +1,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <iostream>
 #include <mutex>
 #include <optional>
@@ -24,6 +26,7 @@
 #include "gb/app/frontend/realtime/session_models.hpp"
 #include "gb/app/frontend/realtime/save_slots.hpp"
 #include "gb/app/frontend/realtime/timing_policy.hpp"
+#include "gb/app/frontend/realtime/top_menu.hpp"
 #include "gb/app/frontend/realtime.hpp"
 #include "gb/app/frontend/realtime_support.hpp"
 
@@ -152,6 +155,7 @@ int runRealtime(
     bool showScaleMenu = false;
     bool showPaletteMenu = false;
     bool showControlsMenu = false;
+    bool showTopMenuBar = true;
     bool requestCapture = false;
     FullscreenScaleMode fullscreenMode = FullscreenScaleMode::CrispFit;
     LinkCableMode linkCableMode = LinkCableMode::Off;
@@ -159,6 +163,7 @@ int runRealtime(
     int scaleMenuIndex = 0;
     int controlsMenuIndex = 0;
     bool controlsAwaitKey = false;
+    bool controlsEditPad = false;
     int activeSaveSlot = 0;
     bool cheatsEnabled = true;
     bool replayRecording = false;
@@ -176,7 +181,8 @@ int runRealtime(
         filterMode = savedFilter.value();
     }
     ControlBindings controls = defaultControlBindings();
-    (void)loadControlBindings(controlsPath, controls);
+    const std::string globalControlsPath = (std::filesystem::path("states") / "global.controls").string();
+    (void)loadControlBindingsWithFallback(controlsPath, globalControlsPath, controls);
     auto cheatsLoad = loadCheatsFromFile(cheatsPath);
     std::vector<CheatCode> cheats = std::move(cheatsLoad.cheats);
     if (!cheatsLoad.errors.empty()) {
@@ -217,6 +223,9 @@ int runRealtime(
     MemorySearchState memorySearch{};
     std::optional<gb::u16> selectedSpriteAddr;
     int spriteScrollRows = 0;
+    std::optional<TopMenuSection> openTopMenuSection;
+    std::optional<TopMenuSection> hoveredTopMenuSection;
+    int hoveredTopMenuItem = -1;
     MemoryWatch memoryWatch{};
     MemoryEditState memoryEdit{};
     MemoryWriteUiState memoryWriteUi{};
@@ -498,6 +507,146 @@ int runRealtime(
         uiMessageFrames = 120;
     };
 
+    const auto saveStateToActiveSlot = [&]() {
+        const std::string slotStatePath = saveSlotStatePath(statePath, activeSaveSlot);
+        const std::string slotMetaPath = saveSlotMetaPath(statePath, activeSaveSlot);
+        const std::string slotThumbPath = saveSlotThumbnailPath(statePath, activeSaveSlot);
+        bool saved = false;
+        {
+            std::lock_guard<std::mutex> gbLock(gbMutex);
+            saved = gb.saveStateToFile(slotStatePath);
+        }
+        if (saved) {
+            SaveSlotMeta meta{};
+            meta.slot = activeSaveSlot;
+            meta.title = gb.cartridge().title();
+            meta.timestamp = nowIso8601Local();
+            meta.frame = emulatedFrameCounter.load(std::memory_order_relaxed);
+            writeSaveSlotMeta(slotMetaPath, meta);
+            saveRgb24Ppm(slotThumbPath, pixels);
+
+            char msg[40];
+            std::snprintf(msg, sizeof(msg), "STATE SAVED S%d", activeSaveSlot);
+            uiMessage = msg;
+            std::cout << "state salvo: " << slotStatePath << "\n";
+        } else {
+            uiMessage = "SAVE FAIL";
+            std::cerr << "falha ao salvar state slot: " << slotStatePath << "\n";
+        }
+        uiMessageFrames = 180;
+    };
+
+    const auto loadStateFromActiveSlot = [&]() {
+        const std::string slotStatePath = saveSlotStatePath(statePath, activeSaveSlot);
+        bool loaded = false;
+        bool loadedLegacy = false;
+        {
+            std::lock_guard<std::mutex> gbLock(gbMutex);
+            loaded = gb.loadStateFromFile(slotStatePath);
+            if (!loaded && activeSaveSlot == 0) {
+                loadedLegacy = gb.loadStateFromFile(legacyStatePath);
+            }
+            if (loaded || loadedLegacy) {
+                timeline.reset(gb);
+                resetMemoryWatch(memoryWatch, gb.bus());
+                enqueueRawFrameLocked();
+            }
+        }
+        if (audioEnabled) {
+            SDL_ClearQueuedAudio(audioDev);
+            audioRing.clear();
+        }
+        if (loaded || loadedLegacy) {
+            char msg[40];
+            std::snprintf(msg, sizeof(msg), "STATE LOADED S%d", activeSaveSlot);
+            uiMessage = msg;
+            if (loaded) {
+                std::cout << "state carregado: " << slotStatePath << "\n";
+            }
+        } else {
+            uiMessage = "NO STATE";
+            std::cerr << "state nao encontrado: " << slotStatePath << "\n";
+        }
+        uiMessageFrames = 180;
+    };
+
+    const auto togglePauseState = [&]() {
+        paused = !paused;
+        if (audioEnabled) {
+            SDL_ClearQueuedAudio(audioDev);
+            audioRing.clear();
+        }
+        pausedAtomic.store(paused, std::memory_order_relaxed);
+        updateWindowTitle(window, gb.cartridge().title(), paused, muted);
+    };
+
+    const auto toggleMutedState = [&]() {
+        muted = !muted;
+        if (audioEnabled && muted) {
+            SDL_ClearQueuedAudio(audioDev);
+            audioRing.clear();
+        }
+        updateWindowTitle(window, gb.cartridge().title(), paused, muted);
+    };
+
+    const auto toggleDebugPanelState = [&]() {
+        showPanel = !showPanel;
+        if (!showPanel) {
+            selectedSpriteAddr.reset();
+            memoryEdit.active = false;
+            breakpointEdit.active = false;
+            memorySearch.ui.visible = false;
+            memorySearch.ui.editingValue = false;
+            SDL_StopTextInput();
+        }
+    };
+
+    const auto toggleBreakpointPanelState = [&]() {
+        showBreakpointMenu = !showBreakpointMenu;
+        if (!showBreakpointMenu && breakpointEdit.active) {
+            breakpointEdit.active = false;
+            stopTextInputIfUnused();
+        }
+        uiMessage = showBreakpointMenu ? "BP MENU ON" : "BP MENU OFF";
+        uiMessageFrames = 90;
+    };
+
+    const auto toggleFullscreenState = [&]() {
+        fullscreen = !fullscreen;
+        showScaleMenu = false;
+        showPaletteMenu = false;
+        showControlsMenu = false;
+        controlsAwaitKey = false;
+        openTopMenuSection.reset();
+        if (memoryEdit.active) {
+            memoryEdit.active = false;
+        }
+        if (breakpointEdit.active) {
+            breakpointEdit.active = false;
+        }
+        memorySearch.ui.editingValue = false;
+        stopTextInputIfUnused();
+        Uint32 flags = 0;
+        if (fullscreen) {
+            showPanel = false;
+            memorySearch.ui.visible = false;
+            selectedSpriteAddr.reset();
+            flags = SDL_WINDOW_FULLSCREEN_DESKTOP;
+        }
+
+        if (SDL_SetWindowFullscreen(window, flags) != 0) {
+            std::cerr << "falha ao alternar fullscreen: " << SDL_GetError() << "\n";
+            fullscreen = !fullscreen;
+        } else {
+            if (!fullscreen) {
+                SDL_SetWindowSize(window, gameWidth + panelWidth, gameHeight);
+                SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+            }
+            uiMessage = fullscreen ? "FULLSCREEN ON" : "FULLSCREEN OFF";
+            uiMessageFrames = 120;
+        }
+    };
+
     syncThreadState();
     {
         std::lock_guard<std::mutex> gbLock(gbMutex);
@@ -768,6 +917,433 @@ int runRealtime(
     double debugFps = 0.0;
     auto fpsWindowStart = std::chrono::steady_clock::now();
     std::uint64_t fpsWindowFrames = emulatedFrameCounter.load(std::memory_order_relaxed);
+    constexpr int kBindActionCount = static_cast<int>(BindAction::Count);
+
+    const auto sanitizeUiText = [](const std::string& text) {
+        std::string out;
+        out.reserve(text.size());
+        for (unsigned char raw : text) {
+            char ch = static_cast<char>(std::toupper(raw));
+            const bool ok = (ch >= 'A' && ch <= 'Z')
+                || (ch >= '0' && ch <= '9')
+                || ch == ' '
+                || ch == '-'
+                || ch == '_'
+                || ch == ':'
+                || ch == '.'
+                || ch == '/';
+            out.push_back(ok ? ch : ' ');
+        }
+        while (out.find("  ") != std::string::npos) {
+            out.replace(out.find("  "), 2, " ");
+        }
+        if (!out.empty() && out.front() == ' ') {
+            out.erase(out.begin());
+        }
+        if (!out.empty() && out.back() == ' ') {
+            out.pop_back();
+        }
+        if (out.empty()) {
+            out = "NONE";
+        }
+        return out;
+    };
+    const auto clipUiText = [&](const std::string& text, std::size_t maxChars) {
+        if (text.size() <= maxChars) {
+            return text;
+        }
+        return text.substr(0, maxChars);
+    };
+    const auto keyBindingLabel = [&](int key) {
+        if (key == SDLK_UNKNOWN || key == 0) {
+            return std::string("NONE");
+        }
+        const char* raw = SDL_GetKeyName(static_cast<SDL_Keycode>(key));
+        if (!raw || raw[0] == '\0') {
+            return std::string("KEY");
+        }
+        return sanitizeUiText(raw);
+    };
+    const auto padBindingLabel = [&](int button) {
+        if (button < 0) {
+            return std::string("NONE");
+        }
+        if (button >= static_cast<int>(SDL_CONTROLLER_BUTTON_MAX)) {
+            return std::string("BTN ") + std::to_string(button);
+        }
+        const char* raw = SDL_GameControllerGetStringForButton(static_cast<SDL_GameControllerButton>(button));
+        if (!raw || raw[0] == '\0') {
+            return std::string("BTN ") + std::to_string(button);
+        }
+        return sanitizeUiText(raw);
+    };
+    const auto persistControlsWithMessage = [&](const std::string& okMessage) {
+        if (saveControlBindingsWithMirror(controlsPath, globalControlsPath, controls)) {
+            uiMessage = okMessage;
+        } else {
+            uiMessage = "CTRL SAVE FAIL";
+        }
+        uiMessageFrames = 120;
+    };
+    const auto openControlsMenuState = [&]() {
+        showControlsMenu = true;
+        controlsAwaitKey = false;
+        controlsEditPad = false;
+        controlsMenuIndex = std::clamp(controlsMenuIndex, 0, kBindActionCount - 1);
+        showScaleMenu = false;
+        showPaletteMenu = false;
+        openTopMenuSection.reset();
+        if (memoryEdit.active) {
+            memoryEdit.active = false;
+        }
+        if (breakpointEdit.active) {
+            breakpointEdit.active = false;
+        }
+        memorySearch.ui.editingValue = false;
+        stopTextInputIfUnused();
+        fastForward = false;
+        fastForwardAtomic.store(false, std::memory_order_relaxed);
+        uiMessage = "CONTROLS MENU ON";
+        uiMessageFrames = 90;
+    };
+    const auto dispatchTopMenuAction = [&](TopMenuAction action) {
+        switch (action) {
+        case TopMenuAction::TogglePause:
+            togglePauseState();
+            break;
+        case TopMenuAction::ToggleMute:
+            toggleMutedState();
+            break;
+        case TopMenuAction::ToggleFastForward:
+            fastForward = !fastForward;
+            fastForwardAtomic.store(fastForward, std::memory_order_relaxed);
+            uiMessage = fastForward ? "FAST FORWARD" : "NORMAL SPEED";
+            uiMessageFrames = 60;
+            break;
+        case TopMenuAction::SaveState:
+            saveStateToActiveSlot();
+            break;
+        case TopMenuAction::LoadState:
+            loadStateFromActiveSlot();
+            break;
+        case TopMenuAction::BackToMenu:
+            uiMessage = "BACK TO MENU";
+            uiMessageFrames = 30;
+            backToMenu = true;
+            running = false;
+            break;
+        case TopMenuAction::ExitApp:
+            running = false;
+            break;
+        case TopMenuAction::ToggleFullscreen:
+            toggleFullscreenState();
+            break;
+        case TopMenuAction::ToggleScaleMenu:
+            if (!fullscreen) {
+                uiMessage = "SCALE ONLY FULLSCREEN";
+                uiMessageFrames = 120;
+                break;
+            }
+            showScaleMenu = !showScaleMenu;
+            showPaletteMenu = false;
+            showControlsMenu = false;
+            scaleMenuIndex = static_cast<int>(fullscreenMode);
+            break;
+        case TopMenuAction::TogglePaletteMenu:
+            showPaletteMenu = !showPaletteMenu;
+            showScaleMenu = false;
+            showControlsMenu = false;
+            fastForward = false;
+            paletteMenuIndex = std::clamp(static_cast<int>(paletteMode), 0, cgbPaletteAvailable ? 2 : 1);
+            break;
+        case TopMenuAction::CycleFilter:
+            if (filterMode == VideoFilterMode::None) {
+                filterMode = VideoFilterMode::Scanline;
+            } else if (filterMode == VideoFilterMode::Scanline) {
+                filterMode = VideoFilterMode::Lcd;
+            } else {
+                filterMode = VideoFilterMode::None;
+            }
+            saveFilterPreference(filtersPath, filterMode);
+            uiMessage = filterUiName(filterMode);
+            uiMessageFrames = 120;
+            break;
+        case TopMenuAction::CaptureFrame:
+            requestCapture = true;
+            break;
+        case TopMenuAction::ToggleDebugPanel:
+            toggleDebugPanelState();
+            break;
+        case TopMenuAction::ToggleBreakpointMenu:
+            toggleBreakpointPanelState();
+            break;
+        case TopMenuAction::ToggleSearchPanel:
+            if (!showPanel) {
+                showPanel = true;
+            }
+            memorySearch.ui.visible = !memorySearch.ui.visible;
+            memorySearch.ui.editingValue = false;
+            stopTextInputIfUnused();
+            uiMessage = memorySearch.ui.visible ? "SEARCH ON" : "SEARCH OFF";
+            uiMessageFrames = 90;
+            break;
+        case TopMenuAction::OpenControlsMenu:
+            openControlsMenuState();
+            break;
+        default:
+            break;
+        }
+    };
+    struct TopMenuUiItem {
+        TopMenuAction action = TopMenuAction::None;
+        std::string label{};
+    };
+    const auto hasLoadableState = [&]() {
+        const std::string slotStatePath = saveSlotStatePath(statePath, activeSaveSlot);
+        if (std::filesystem::exists(slotStatePath)) {
+            return true;
+        }
+        return activeSaveSlot == 0 && std::filesystem::exists(legacyStatePath);
+    };
+    const auto buildTopMenuUiItems = [&](TopMenuSection section) {
+        std::vector<TopMenuUiItem> out;
+        switch (section) {
+        case TopMenuSection::Session:
+            out.push_back({TopMenuAction::TogglePause, paused ? "CONTINUAR" : "PAUSAR"});
+            if (audioEnabled) {
+                out.push_back({TopMenuAction::ToggleMute, muted ? "ATIVAR AUDIO" : "MUTAR AUDIO"});
+            }
+            out.push_back({TopMenuAction::ToggleFastForward, fastForward ? "FF NORMAL" : "FF LIGAR"});
+            out.push_back({TopMenuAction::SaveState, "SALVAR STATE"});
+            if (hasLoadableState()) {
+                out.push_back({TopMenuAction::LoadState, "CARREGAR STATE"});
+            }
+            out.push_back({TopMenuAction::BackToMenu, "VOLTAR MENU ROM"});
+            out.push_back({TopMenuAction::ExitApp, "SAIR"});
+            break;
+        case TopMenuSection::Image:
+            out.push_back({TopMenuAction::ToggleFullscreen, fullscreen ? "SAIR FULLSCREEN" : "ENTRAR FULLSCREEN"});
+            if (fullscreen) {
+                out.push_back({TopMenuAction::ToggleScaleMenu, "MENU ESCALA"});
+            }
+            out.push_back({TopMenuAction::TogglePaletteMenu, "MENU PALETA"});
+            out.push_back({TopMenuAction::CycleFilter, "CICLAR FILTRO"});
+            out.push_back({TopMenuAction::CaptureFrame, "CAPTURA TELA"});
+            break;
+        case TopMenuSection::Debug:
+            out.push_back({TopMenuAction::ToggleDebugPanel, showPanel ? "OCULTAR DEBUG" : "MOSTRAR DEBUG"});
+            if (showPanel) {
+                out.push_back({TopMenuAction::ToggleBreakpointMenu, showBreakpointMenu ? "OCULTAR BP WP" : "MOSTRAR BP WP"});
+                out.push_back({TopMenuAction::ToggleSearchPanel, memorySearch.ui.visible ? "OCULTAR BUSCA" : "MOSTRAR BUSCA"});
+            }
+            break;
+        case TopMenuSection::Controls:
+        default:
+            out.push_back({TopMenuAction::OpenControlsMenu, "ABRIR MENU CONTROLES"});
+            break;
+        }
+        return out;
+    };
+    const auto topMenuDropdownRectForItems = [&](int outputW, TopMenuSection section, const std::vector<TopMenuUiItem>& items) {
+        const auto sec = topMenuSectionRect(outputW, section);
+        int maxChars = 0;
+        for (const auto& item : items) {
+            const int chars = static_cast<int>(sanitizeUiText(item.label).size());
+            if (chars > maxChars) {
+                maxChars = chars;
+            }
+        }
+        const int width = std::max(sec.w + 30, maxChars * 6 + 16);
+        const int height = std::max(12, static_cast<int>(items.size()) * topMenuItemHeight() + 8);
+        return TopMenuRect{sec.x, topMenuBarHeight(), width, height};
+    };
+    const auto hitTestTopMenuUiAction = [&](int outputW, TopMenuSection section, int px, int py) -> std::optional<TopMenuAction> {
+        const auto items = buildTopMenuUiItems(section);
+        if (items.empty()) {
+            return std::nullopt;
+        }
+        const auto drop = topMenuDropdownRectForItems(outputW, section, items);
+        if (!topMenuRectContains(drop, px, py)) {
+            return std::nullopt;
+        }
+        const int localY = py - drop.y - 4;
+        if (localY < 0) {
+            return std::nullopt;
+        }
+        const int row = localY / topMenuItemHeight();
+        if (row < 0 || row >= static_cast<int>(items.size())) {
+            return std::nullopt;
+        }
+        return items[static_cast<std::size_t>(row)].action;
+    };
+    const auto drawTopTaskbar = [&](int outputW) {
+        if (!showTopMenuBar) {
+            return;
+        }
+        const int barH = topMenuBarHeight();
+        SDL_SetRenderDrawColor(renderer, 6, 10, 18, 228);
+        SDL_Rect bar{0, 0, outputW, barH};
+        SDL_RenderFillRect(renderer, &bar);
+        SDL_SetRenderDrawColor(renderer, 60, 80, 122, 255);
+        SDL_RenderDrawLine(renderer, 0, barH - 1, outputW, barH - 1);
+
+        for (int i = 0; i < static_cast<int>(TopMenuSection::Count); ++i) {
+            const auto section = static_cast<TopMenuSection>(i);
+            const auto r = topMenuSectionRect(outputW, section);
+            const bool active = openTopMenuSection.has_value() && openTopMenuSection.value() == section;
+            const bool hovered = hoveredTopMenuSection.has_value() && hoveredTopMenuSection.value() == section;
+            SDL_SetRenderDrawColor(
+                renderer,
+                active ? 40 : (hovered ? 30 : 20),
+                active ? 56 : (hovered ? 44 : 34),
+                active ? 92 : (hovered ? 78 : 62),
+                255
+            );
+            SDL_Rect secRect{r.x, r.y, r.w, r.h};
+            SDL_RenderFillRect(renderer, &secRect);
+            SDL_SetRenderDrawColor(renderer, 90, 112, 156, 255);
+            SDL_RenderDrawRect(renderer, &secRect);
+            drawHexText(
+                renderer,
+                r.x + 6,
+                r.y + 6,
+                sanitizeUiText(topMenuSectionLabel(section)),
+                active ? SDL_Color{255, 230, 120, 255} : SDL_Color{205, 220, 246, 255},
+                1
+            );
+        }
+
+        if (openTopMenuSection.has_value()) {
+            const auto section = openTopMenuSection.value();
+            const auto items = buildTopMenuUiItems(section);
+            const auto drop = topMenuDropdownRectForItems(outputW, section, items);
+            SDL_SetRenderDrawColor(renderer, 8, 12, 24, 236);
+            SDL_Rect dropRect{drop.x, drop.y, drop.w, drop.h};
+            SDL_RenderFillRect(renderer, &dropRect);
+            SDL_SetRenderDrawColor(renderer, 90, 110, 150, 255);
+            SDL_RenderDrawRect(renderer, &dropRect);
+
+            const int rowH = topMenuItemHeight();
+            for (int i = 0; i < static_cast<int>(items.size()); ++i) {
+                const int rowY = drop.y + 4 + i * rowH;
+                if (i == hoveredTopMenuItem) {
+                    SDL_SetRenderDrawColor(renderer, 30, 42, 70, 255);
+                    SDL_Rect rowBg{drop.x + 2, rowY, drop.w - 4, rowH};
+                    SDL_RenderFillRect(renderer, &rowBg);
+                }
+                drawHexText(
+                    renderer,
+                    drop.x + 6,
+                    rowY + 4,
+                    sanitizeUiText(items[static_cast<std::size_t>(i)].label),
+                    i == hoveredTopMenuItem ? SDL_Color{255, 230, 120, 255} : SDL_Color{205, 220, 246, 255},
+                    1
+                );
+            }
+        }
+
+        char status[80];
+        std::snprintf(
+            status,
+            sizeof(status),
+            "%s %s %s",
+            paused ? "PAUSADO" : "RODANDO",
+            muted ? "MUTE" : "AUDIO",
+            fastForward ? "FF" : "NORMAL"
+        );
+        const std::string statusText = sanitizeUiText(status);
+        const int statusX = std::max(8, outputW - static_cast<int>(statusText.size()) * 6 - 12);
+        drawHexText(renderer, statusX, 8, statusText, SDL_Color{150, 188, 236, 255}, 1);
+    };
+    const auto controlsMenuLayout = [&](int outputW, int outputH) {
+        const int boxW = std::max(420, std::min(620, outputW - 24));
+        const int boxH = std::max(250, std::min(340, outputH - 24));
+        const int x = (outputW - boxW) / 2;
+        const int y = (outputH - boxH) / 2;
+        return PopupWindowLayout{
+            SDL_Rect{x, y, boxW, boxH},
+            SDL_Rect{x + boxW - 20, y + 4, 14, 12},
+        };
+    };
+    const auto drawControlsMenuOverlay = [&](int outputW, int outputH) {
+        const auto layout = controlsMenuLayout(outputW, outputH);
+        const int x = layout.box.x;
+        const int y = layout.box.y;
+        const int boxW = layout.box.w;
+        const int boxH = layout.box.h;
+        const int rowH = 20;
+        const int tableY = y + 54;
+
+        SDL_SetRenderDrawColor(renderer, 8, 12, 24, 236);
+        SDL_RenderFillRect(renderer, &layout.box);
+        SDL_SetRenderDrawColor(renderer, 90, 110, 150, 255);
+        SDL_RenderDrawRect(renderer, &layout.box);
+
+        SDL_SetRenderDrawColor(renderer, 28, 38, 62, 255);
+        SDL_RenderFillRect(renderer, &layout.closeButton);
+        SDL_SetRenderDrawColor(renderer, 96, 122, 170, 255);
+        SDL_RenderDrawRect(renderer, &layout.closeButton);
+        drawHexText(renderer, layout.closeButton.x + 4, layout.closeButton.y + 2, "X", SDL_Color{255, 228, 140, 255}, 1);
+
+        drawHexText(renderer, x + 12, y + 10, "CONTROLS MENU", SDL_Color{236, 242, 255, 255}, 1);
+        drawHexText(renderer, x + 12, y + 24, "F11 TOGGLE  ENTER CHANGE  DEL CLEAR  X CLOSE", SDL_Color{170, 180, 204, 255}, 1);
+
+        const int colAction = x + 14;
+        const int colKey = x + boxW * 34 / 100;
+        const int colPad = x + boxW * 64 / 100;
+        drawHexText(renderer, colAction, tableY - 12, "ACTION", SDL_Color{158, 190, 236, 255}, 1);
+        drawHexText(renderer, colKey, tableY - 12, "KEYBOARD", SDL_Color{158, 190, 236, 255}, 1);
+        drawHexText(renderer, colPad, tableY - 12, "CONTROLLER", SDL_Color{158, 190, 236, 255}, 1);
+
+        for (int i = 0; i < kBindActionCount; ++i) {
+            const int rowY = tableY + i * rowH;
+            if (rowY + rowH > y + boxH - 44) {
+                break;
+            }
+            const bool selectedRow = i == controlsMenuIndex;
+            if (selectedRow) {
+                SDL_SetRenderDrawColor(renderer, 28, 38, 62, 255);
+                SDL_Rect rowBg{x + 8, rowY - 1, boxW - 16, rowH - 2};
+                SDL_RenderFillRect(renderer, &rowBg);
+            }
+            const auto action = static_cast<BindAction>(i);
+            const std::string keyText = clipUiText(keyBindingLabel(controls.keys[static_cast<std::size_t>(i)]), 14);
+            const std::string padText = clipUiText(padBindingLabel(controls.padButtons[static_cast<std::size_t>(i)]), 14);
+
+            drawHexText(
+                renderer,
+                colAction,
+                rowY + 4,
+                bindActionName(action),
+                selectedRow ? SDL_Color{255, 230, 120, 255} : SDL_Color{214, 224, 242, 255},
+                1
+            );
+            drawHexText(
+                renderer,
+                colKey,
+                rowY + 4,
+                keyText,
+                selectedRow && !controlsEditPad ? SDL_Color{255, 230, 120, 255} : SDL_Color{202, 212, 230, 255},
+                1
+            );
+            drawHexText(
+                renderer,
+                colPad,
+                rowY + 4,
+                padText,
+                selectedRow && controlsEditPad ? SDL_Color{255, 230, 120, 255} : SDL_Color{202, 212, 230, 255},
+                1
+            );
+        }
+
+        const int footerY = y + boxH - 28;
+        if (controlsAwaitKey) {
+            const std::string wait = controlsEditPad ? "PRESS CONTROLLER BUTTON  ESC CANCEL" : "PRESS KEYBOARD KEY  ESC CANCEL";
+            drawHexText(renderer, x + 12, footerY, wait, SDL_Color{255, 214, 120, 255}, 1);
+        } else {
+            drawHexText(renderer, x + 12, footerY, "UP DOWN ROW  LEFT RIGHT FIELD  R RESET  S SAVE", SDL_Color{160, 172, 198, 255}, 1);
+        }
+    };
 
     while (running) {
         if (paused != pausedAtomic.load(std::memory_order_relaxed)) {
@@ -827,6 +1403,16 @@ int runRealtime(
                 }
             }
             if (ev.type == SDL_CONTROLLERBUTTONDOWN || ev.type == SDL_CONTROLLERBUTTONUP) {
+                if (showControlsMenu) {
+                    if (controlsAwaitKey && controlsEditPad && ev.type == SDL_CONTROLLERBUTTONDOWN) {
+                        const int clamped = std::clamp(controlsMenuIndex, 0, kBindActionCount - 1);
+                        controls.padButtons[static_cast<std::size_t>(clamped)] = static_cast<int>(ev.cbutton.button);
+                        controlsAwaitKey = false;
+                        const std::string msg = std::string(bindActionName(static_cast<BindAction>(clamped))) + " PAD SET";
+                        persistControlsWithMessage(msg);
+                    }
+                    continue;
+                }
                 if (showScaleMenu || showPaletteMenu || memoryEdit.active || breakpointEdit.active || memorySearch.ui.editingValue) {
                     continue;
                 }
@@ -835,9 +1421,75 @@ int runRealtime(
                 continue;
             }
             if (ev.type == SDL_KEYDOWN && ev.key.repeat == 0) {
+                if (ev.key.keysym.sym == SDLK_F11) {
+                    if (showControlsMenu) {
+                        showControlsMenu = false;
+                        controlsAwaitKey = false;
+                        uiMessage = "CONTROLS MENU OFF";
+                        uiMessageFrames = 90;
+                    } else {
+                        openControlsMenuState();
+                    }
+                    continue;
+                }
+                if (ev.key.keysym.sym == SDLK_ESCAPE && openTopMenuSection.has_value()) {
+                    openTopMenuSection.reset();
+                    continue;
+                }
+                if (openTopMenuSection.has_value()) {
+                    openTopMenuSection.reset();
+                }
+                if (showControlsMenu) {
+                    controlsMenuIndex = std::clamp(controlsMenuIndex, 0, kBindActionCount - 1);
+                    if (controlsAwaitKey) {
+                        if (ev.key.keysym.sym == SDLK_ESCAPE) {
+                            controlsAwaitKey = false;
+                            uiMessage = "CTRL MAP CANCEL";
+                            uiMessageFrames = 90;
+                        } else {
+                            controls.keys[static_cast<std::size_t>(controlsMenuIndex)] = static_cast<int>(ev.key.keysym.sym);
+                            controlsAwaitKey = false;
+                            const std::string msg = std::string(bindActionName(static_cast<BindAction>(controlsMenuIndex))) + " KEY SET";
+                            persistControlsWithMessage(msg);
+                        }
+                        continue;
+                    }
+                    if (ev.key.keysym.sym == SDLK_ESCAPE) {
+                        showControlsMenu = false;
+                        uiMessage = "CONTROLS MENU OFF";
+                        uiMessageFrames = 90;
+                    } else if (ev.key.keysym.sym == SDLK_UP) {
+                        controlsMenuIndex = (controlsMenuIndex + kBindActionCount - 1) % kBindActionCount;
+                    } else if (ev.key.keysym.sym == SDLK_DOWN) {
+                        controlsMenuIndex = (controlsMenuIndex + 1) % kBindActionCount;
+                    } else if (ev.key.keysym.sym == SDLK_LEFT) {
+                        controlsEditPad = false;
+                    } else if (ev.key.keysym.sym == SDLK_RIGHT) {
+                        controlsEditPad = true;
+                    } else if (ev.key.keysym.sym == SDLK_BACKSPACE || ev.key.keysym.sym == SDLK_DELETE) {
+                        if (controlsEditPad) {
+                            controls.padButtons[static_cast<std::size_t>(controlsMenuIndex)] = -1;
+                            persistControlsWithMessage("PAD CLEARED");
+                        } else {
+                            controls.keys[static_cast<std::size_t>(controlsMenuIndex)] = SDLK_UNKNOWN;
+                            persistControlsWithMessage("KEY CLEARED");
+                        }
+                    } else if (ev.key.keysym.sym == SDLK_RETURN || ev.key.keysym.sym == SDLK_KP_ENTER) {
+                        controlsAwaitKey = true;
+                        uiMessage = controlsEditPad ? "PRESS PAD BUTTON" : "PRESS KEYBOARD KEY";
+                        uiMessageFrames = 120;
+                    } else if (ev.key.keysym.sym == SDLK_r) {
+                        controls = defaultControlBindings();
+                        persistControlsWithMessage("CONTROLS RESET");
+                    } else if (ev.key.keysym.sym == SDLK_s) {
+                        persistControlsWithMessage("CONTROLS SAVED");
+                    }
+                    continue;
+                }
                 if (ev.key.keysym.sym == SDLK_n && fullscreen) {
                     showScaleMenu = !showScaleMenu;
                     showPaletteMenu = false;
+                    showControlsMenu = false;
                     scaleMenuIndex = static_cast<int>(fullscreenMode);
                     continue;
                 }
@@ -1001,6 +1653,7 @@ int runRealtime(
                 if (ev.key.keysym.sym == SDLK_v) {
                     showPaletteMenu = !showPaletteMenu;
                     showScaleMenu = false;
+                    showControlsMenu = false;
                     fastForward = false;
                     const int maxIndex = cgbPaletteAvailable ? 2 : 1;
                     paletteMenuIndex = std::clamp(static_cast<int>(paletteMode), 0, maxIndex);
@@ -1032,38 +1685,13 @@ int runRealtime(
                 if (ev.key.keysym.sym == SDLK_ESCAPE) {
                     running = false;
                 } else if (ev.key.keysym.sym == SDLK_SPACE) {
-                    paused = !paused;
-                    if (audioEnabled) {
-                        SDL_ClearQueuedAudio(audioDev);
-                        audioRing.clear();
-                    }
-                    pausedAtomic.store(paused, std::memory_order_relaxed);
-                    updateWindowTitle(window, gb.cartridge().title(), paused, muted);
+                    togglePauseState();
                 } else if (ev.key.keysym.sym == SDLK_p) {
-                    muted = !muted;
-                    if (audioEnabled && muted) {
-                        SDL_ClearQueuedAudio(audioDev);
-                        audioRing.clear();
-                    }
-                    updateWindowTitle(window, gb.cartridge().title(), paused, muted);
+                    toggleMutedState();
                 } else if (ev.key.keysym.sym == SDLK_i) {
-                    showPanel = !showPanel;
-                    if (!showPanel) {
-                        selectedSpriteAddr.reset();
-                        memoryEdit.active = false;
-                        breakpointEdit.active = false;
-                        memorySearch.ui.visible = false;
-                        memorySearch.ui.editingValue = false;
-                        SDL_StopTextInput();
-                    }
+                    toggleDebugPanelState();
                 } else if (ev.key.keysym.sym == SDLK_d) {
-                    showBreakpointMenu = !showBreakpointMenu;
-                    if (!showBreakpointMenu && breakpointEdit.active) {
-                        breakpointEdit.active = false;
-                        stopTextInputIfUnused();
-                    }
-                    uiMessage = showBreakpointMenu ? "BP MENU ON" : "BP MENU OFF";
-                    uiMessageFrames = 90;
+                    toggleBreakpointPanelState();
                 } else if (ev.key.keysym.sym == SDLK_j) {
                     if (linkCableMode == LinkCableMode::Off) {
                         linkCableMode = LinkCableMode::Loopback;
@@ -1184,36 +1812,7 @@ int runRealtime(
                     uiMessage = frameTimelineLabel(timeline);
                     uiMessageFrames = 120;
                 } else if (ev.key.keysym.sym == SDLK_f) {
-                    fullscreen = !fullscreen;
-                    showScaleMenu = false;
-                    showPaletteMenu = false;
-                    if (memoryEdit.active) {
-                        memoryEdit.active = false;
-                    }
-                    if (breakpointEdit.active) {
-                        breakpointEdit.active = false;
-                    }
-                    memorySearch.ui.editingValue = false;
-                    stopTextInputIfUnused();
-                    Uint32 flags = 0;
-                    if (fullscreen) {
-                        showPanel = false;
-                        memorySearch.ui.visible = false;
-                        selectedSpriteAddr.reset();
-                        flags = SDL_WINDOW_FULLSCREEN_DESKTOP;
-                    }
-
-                    if (SDL_SetWindowFullscreen(window, flags) != 0) {
-                        std::cerr << "falha ao alternar fullscreen: " << SDL_GetError() << "\n";
-                        fullscreen = !fullscreen;
-                    } else {
-                        if (!fullscreen) {
-                            SDL_SetWindowSize(window, gameWidth + panelWidth, gameHeight);
-                            SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
-                        }
-                        uiMessage = fullscreen ? "FULLSCREEN ON" : "FULLSCREEN OFF";
-                        uiMessageFrames = 120;
-                    }
+                    toggleFullscreenState();
                 } else if (ev.key.keysym.sym == SDLK_l && (ev.key.keysym.mod & KMOD_CTRL) == 0) {
                     uiMessage = "BACK TO MENU";
                     uiMessageFrames = 30;
@@ -1224,6 +1823,15 @@ int runRealtime(
                     fastForwardAtomic.store(true, std::memory_order_relaxed);
                     uiMessage = "FAST FORWARD";
                     uiMessageFrames = 60;
+                } else if (ev.key.keysym.sym == SDLK_F3 && (ev.key.keysym.mod & KMOD_CTRL) == 0) {
+                    showTopMenuBar = !showTopMenuBar;
+                    if (!showTopMenuBar) {
+                        openTopMenuSection.reset();
+                    }
+                    hoveredTopMenuSection.reset();
+                    hoveredTopMenuItem = -1;
+                    uiMessage = showTopMenuBar ? "TOP BAR ON" : "TOP BAR OFF";
+                    uiMessageFrames = 90;
                 } else if (ev.key.keysym.sym == SDLK_F1) {
                     activeSaveSlot = normalizeSaveSlot(activeSaveSlot - 1);
                     char msg[32];
@@ -1236,74 +1844,18 @@ int runRealtime(
                     std::snprintf(msg, sizeof(msg), "SLOT %d", activeSaveSlot);
                     uiMessage = msg;
                     uiMessageFrames = 90;
-                } else if (ev.key.keysym.sym == SDLK_F3
-                           || (ev.key.keysym.sym == SDLK_s && (ev.key.keysym.mod & KMOD_CTRL))) {
-                    const std::string slotStatePath = saveSlotStatePath(statePath, activeSaveSlot);
-                    const std::string slotMetaPath = saveSlotMetaPath(statePath, activeSaveSlot);
-                    const std::string slotThumbPath = saveSlotThumbnailPath(statePath, activeSaveSlot);
-                    bool saved = false;
-                    {
-                        std::lock_guard<std::mutex> gbLock(gbMutex);
-                        saved = gb.saveStateToFile(slotStatePath);
-                    }
-                    if (saved) {
-                        SaveSlotMeta meta{};
-                        meta.slot = activeSaveSlot;
-                        meta.title = gb.cartridge().title();
-                        meta.timestamp = nowIso8601Local();
-                        meta.frame = emulatedFrameCounter.load(std::memory_order_relaxed);
-                        writeSaveSlotMeta(slotMetaPath, meta);
-                        saveRgb24Ppm(slotThumbPath, pixels);
-
-                        char msg[40];
-                        std::snprintf(msg, sizeof(msg), "STATE SAVED S%d", activeSaveSlot);
-                        uiMessage = msg;
-                        std::cout << "state salvo: " << slotStatePath << "\n";
-                    } else {
-                        uiMessage = "SAVE FAIL";
-                        std::cerr << "falha ao salvar state slot: " << slotStatePath << "\n";
-                    }
-                    uiMessageFrames = 180;
+                } else if (ev.key.keysym.sym == SDLK_s && (ev.key.keysym.mod & KMOD_CTRL)) {
+                    saveStateToActiveSlot();
                 } else if (ev.key.keysym.sym == SDLK_F5
                            || (ev.key.keysym.sym == SDLK_l && (ev.key.keysym.mod & KMOD_CTRL))) {
-                    const std::string slotStatePath = saveSlotStatePath(statePath, activeSaveSlot);
-                    bool loaded = false;
-                    bool loadedLegacy = false;
-                    {
-                        std::lock_guard<std::mutex> gbLock(gbMutex);
-                        loaded = gb.loadStateFromFile(slotStatePath);
-                        if (!loaded && activeSaveSlot == 0) {
-                            loadedLegacy = gb.loadStateFromFile(legacyStatePath);
-                        }
-                        if (loaded || loadedLegacy) {
-                            timeline.reset(gb);
-                            resetMemoryWatch(memoryWatch, gb.bus());
-                            enqueueRawFrameLocked();
-                        }
-                    }
-                    if (audioEnabled) {
-                        SDL_ClearQueuedAudio(audioDev);
-                        audioRing.clear();
-                    }
-                    if (loaded || loadedLegacy) {
-                        char msg[40];
-                        std::snprintf(msg, sizeof(msg), "STATE LOADED S%d", activeSaveSlot);
-                        uiMessage = msg;
-                        if (loaded) {
-                            std::cout << "state carregado: " << slotStatePath << "\n";
-                        }
-                    } else {
-                        uiMessage = "NO STATE";
-                        std::cerr << "state nao encontrado: " << slotStatePath << "\n";
-                    }
-                    uiMessageFrames = 180;
+                    loadStateFromActiveSlot();
                 } else {
                     std::lock_guard<std::mutex> gbLock(gbMutex);
                     applyKeyboardBinding(gb, controls, ev.key.keysym.sym, true);
                 }
             }
             if (ev.type == SDL_KEYUP) {
-                if (showScaleMenu || showPaletteMenu || memoryEdit.active || breakpointEdit.active || memorySearch.ui.editingValue) {
+                if (showControlsMenu || showScaleMenu || showPaletteMenu || memoryEdit.active || breakpointEdit.active || memorySearch.ui.editingValue) {
                     continue;
                 }
                 if (ev.key.keysym.sym == SDLK_TAB) {
@@ -1359,6 +1911,98 @@ int runRealtime(
                             memorySearch.ui.valueHex.push_back(ch);
                         }
                     }
+                    continue;
+                }
+            }
+            if (ev.type == SDL_MOUSEMOTION) {
+                hoveredTopMenuSection.reset();
+                hoveredTopMenuItem = -1;
+                if (showTopMenuBar) {
+                    int outputW = 0;
+                    int outputH = 0;
+                    SDL_GetRendererOutputSize(renderer, &outputW, &outputH);
+                    const int mx = ev.motion.x;
+                    const int my = ev.motion.y;
+                    hoveredTopMenuSection = hitTestTopMenuSection(outputW, mx, my);
+                    if (openTopMenuSection.has_value()) {
+                        const auto items = buildTopMenuUiItems(openTopMenuSection.value());
+                        const auto drop = topMenuDropdownRectForItems(outputW, openTopMenuSection.value(), items);
+                        if (topMenuRectContains(drop, mx, my)) {
+                            const int localY = my - drop.y - 4;
+                            if (localY >= 0) {
+                                const int row = localY / topMenuItemHeight();
+                                if (row >= 0 && row < static_cast<int>(items.size())) {
+                                    hoveredTopMenuItem = row;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT) {
+                int outputW = 0;
+                int outputH = 0;
+                SDL_GetRendererOutputSize(renderer, &outputW, &outputH);
+                const int mx = ev.button.x;
+                const int my = ev.button.y;
+
+                if (showControlsMenu) {
+                    const auto layout = controlsMenuLayout(outputW, outputH);
+                    if (popupLayoutHitClose(layout, mx, my)) {
+                        showControlsMenu = false;
+                        controlsAwaitKey = false;
+                        uiMessage = "CONTROLS MENU OFF";
+                        uiMessageFrames = 90;
+                        continue;
+                    }
+                }
+                if (showScaleMenu) {
+                    const auto layout = fullscreenScaleMenuLayout(outputW, outputH);
+                    if (popupLayoutHitClose(layout, mx, my)) {
+                        showScaleMenu = false;
+                        uiMessage = "SCALE MENU OFF";
+                        uiMessageFrames = 90;
+                        continue;
+                    }
+                }
+                if (showPaletteMenu) {
+                    const auto layout = paletteModeMenuLayout(outputW, outputH, cgbPaletteAvailable);
+                    if (popupLayoutHitClose(layout, mx, my)) {
+                        showPaletteMenu = false;
+                        uiMessage = "PALETA MENU OFF";
+                        uiMessageFrames = 90;
+                        continue;
+                    }
+                }
+            }
+            if (ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT && showTopMenuBar) {
+                int outputW = 0;
+                int outputH = 0;
+                SDL_GetRendererOutputSize(renderer, &outputW, &outputH);
+                const int mx = ev.button.x;
+                const int my = ev.button.y;
+                bool consumed = false;
+
+                if (const auto section = hitTestTopMenuSection(outputW, mx, my); section.has_value()) {
+                    if (openTopMenuSection.has_value() && openTopMenuSection.value() == section.value()) {
+                        openTopMenuSection.reset();
+                    } else {
+                        openTopMenuSection = section.value();
+                    }
+                    consumed = true;
+                } else if (openTopMenuSection.has_value()) {
+                    const auto action = hitTestTopMenuUiAction(outputW, openTopMenuSection.value(), mx, my);
+                    if (action.has_value()) {
+                        dispatchTopMenuAction(action.value());
+                    }
+                    openTopMenuSection.reset();
+                    hoveredTopMenuItem = -1;
+                    consumed = true;
+                } else if (my >= 0 && my < topMenuBarHeight()) {
+                    consumed = true;
+                }
+
+                if (consumed) {
                     continue;
                 }
             }
@@ -1600,11 +2244,14 @@ int runRealtime(
             renderTexture = sharpTexture;
         }
         SDL_RenderCopy(renderer, renderTexture, nullptr, &blit.gameDst);
+        drawTopTaskbar(outputW);
         if (uiMessageFrames > 0) {
+            const int minMsgY = showTopMenuBar ? (topMenuBarHeight() + 4) : 8;
+            const int msgY = std::max(blit.gameDst.y + 8, minMsgY);
             SDL_SetRenderDrawColor(renderer, 20, 20, 20, 180);
-            SDL_Rect msgBg{blit.gameDst.x + 8, blit.gameDst.y + 8, 160, 20};
+            SDL_Rect msgBg{blit.gameDst.x + 8, msgY, 200, 20};
             SDL_RenderFillRect(renderer, &msgBg);
-            drawHexText(renderer, blit.gameDst.x + 12, blit.gameDst.y + 12, uiMessage, SDL_Color{255, 230, 120, 255}, 1);
+            drawHexText(renderer, blit.gameDst.x + 12, msgY + 4, uiMessage, SDL_Color{255, 230, 120, 255}, 1);
             --uiMessageFrames;
         }
         char statusLine[84];
@@ -1682,6 +2329,9 @@ int runRealtime(
         }
         if (showPaletteMenu) {
             drawPaletteModeMenu(renderer, outputW, outputH, paletteMenuIndex, cgbPaletteAvailable);
+        }
+        if (showControlsMenu) {
+            drawControlsMenuOverlay(outputW, outputH);
         }
         SDL_RenderPresent(renderer);
 

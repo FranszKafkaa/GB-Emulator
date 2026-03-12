@@ -46,6 +46,11 @@ struct BlitLayout {
     SDL_Rect gameDst{};
 };
 
+struct PopupWindowLayout {
+    SDL_Rect box{};
+    SDL_Rect closeButton{};
+};
+
 void updateWindowTitle(SDL_Window* window, const std::string& title, bool paused, bool muted);
 
 const char* displayPaletteUiName(DisplayPaletteMode mode);
@@ -55,6 +60,10 @@ const char* filterUiName(VideoFilterMode mode);
 
 void applySharpenRgb24(const RgbFrame& in, RgbFrame& out);
 void applyVideoFilterRgb24(VideoFilterMode mode, RgbFrame& pixels);
+
+PopupWindowLayout fullscreenScaleMenuLayout(int outputW, int outputH);
+PopupWindowLayout paletteModeMenuLayout(int outputW, int outputH, bool cgbSupported);
+bool popupLayoutHitClose(const PopupWindowLayout& layout, int px, int py);
 
 void drawFullscreenScaleMenu(SDL_Renderer* renderer, int outputW, int outputH, int selectedIndex);
 void drawPaletteModeMenu(SDL_Renderer* renderer, int outputW, int outputH, int selectedIndex, bool cgbSupported);

@@ -22,6 +22,12 @@ Detalhe tecnico:
 - o fast forward (`Tab`) foi ajustado para modo com pacing (sem burst de 6 frames por ciclo)
 - o rewind interno foi otimizado para evitar travadas: saiu de `vector` com `erase(begin)` para fila com `pop_front` O(1)
 - `runFrame` em modo de timing preciso ganhou guarda de ciclos para evitar loop infinito quando LCD estiver desligado
+- tecla `F11` abre menu de remapeamento de controles (teclado e controle) com salvamento em arquivo
+- barra superior no SDL virou menu clicavel por secoes (`SESSAO`, `IMAGEM`, `DEBUG`, `CONTROLES`)
+- tecla `F3` agora mostra/oculta a barra superior
+- itens da barra ficaram dinamicos por disponibilidade e com highlight de hover no mouse
+- menus pop-up agora tem botao `X` clicavel para fechar (`Escala`, `Paleta`, `Controles`)
+- controles agora persistem automatico entre sessoes com perfil por ROM + fallback global
 
 Impacto:
 
@@ -29,6 +35,11 @@ Impacto:
 - nao muda comportamento funcional da emulacao
 - reduz sensacao de "pulo de frame" no fast forward
 - reduz travadas no fast forward em sessoes longas (historico cheio de rewind)
+- melhora usabilidade da interface com descoberta de atalhos na propria tela
+- adiciona navegacao por menu de janela com dropdown clicavel
+- reduz ambiguidade visual com feedback imediato de hover em secoes/itens
+- melhora fechamento de overlays sem depender so de teclado
+- evita perder remapeamento de controles ao fechar e abrir o emulador
 
 ## 0. Como ler este guia
 
@@ -550,7 +561,7 @@ Atalhos (somente pausado):
 
 ### 13.1 Save state
 
-- `F3` ou `Ctrl+S`: salva em `states/<rom>.state`
+- `Ctrl+S`: salva em `states/<rom>.state`
 - `F5` ou `Ctrl+L`: carrega `states/<rom>.state`
 - fallback de leitura: `legacyStatePath` (mesma pasta da ROM)
 
@@ -581,6 +592,8 @@ Atalhos (somente pausado):
 - `Space`: pausar/continuar
 - `P`: mute/unmute
 - `Tab` (segurar): fast forward
+- `F11`: menu de remapeamento de controles
+- `F3`: mostrar/ocultar barra superior
 - `F`: fullscreen on/off
 - `N`: menu de escala (em fullscreen)
 - `V`: menu de paleta
@@ -591,7 +604,7 @@ Atalhos (somente pausado):
 
 ### 14.3 Saves
 
-- `F3` ou `Ctrl+S`: salvar state
+- `Ctrl+S`: salvar state
 - `F5` ou `Ctrl+L`: carregar state
 
 ### 14.4 Debug
@@ -606,6 +619,64 @@ Atalhos (somente pausado):
 - `K`: lock por frame
 - `=`/`-`/`0`: ++/--/zero no endereco WATCH
 - `Left/Right` pausado: rewind/forward de frame
+
+### 14.5 Menu de controles (`F11`)
+
+Quando abre o menu:
+
+- `Up/Down`: seleciona acao (RIGHT/LEFT/UP/DOWN/A/B/SELECT/START)
+- `Left/Right`: escolhe campo (`KEYBOARD` ou `CONTROLLER`)
+- `Enter`: entra em modo captura para redefinir o input
+- `Del`/`Backspace`: limpa binding selecionado
+- `R`: restaura padrao
+- `S`: salva bindings no arquivo de controles
+- `Esc` ou `F11`: fecha menu
+
+O menu mostra feedback visual do que esta selecionado e salva em disco para persistir entre execucoes.
+Tambem e possivel fechar pelo botao `X` no canto superior direito.
+
+### 14.6 Barra superior
+
+Durante a sessao SDL existe uma barra no topo com secoes clicaveis:
+
+- `SESSAO`: pausar, mutar, fast forward, save/load, voltar ao menu de ROM, sair
+- `IMAGEM`: fullscreen, escala, paleta, filtro, captura
+- `DEBUG`: debug panel, BP/WP, busca de memoria
+- `CONTROLES`: abrir menu de remapeamento
+
+Comportamento:
+
+- clique na secao abre/fecha dropdown
+- clique em item executa acao imediatamente
+- `Esc` fecha dropdown aberto
+- `F3` oculta/mostra a barra inteira
+- hover no mouse destaca secao e item
+- itens aparecem quando disponiveis no contexto atual (por exemplo, `MENU ESCALA` apenas em fullscreen)
+
+### 14.7 Fechamento por `X`
+
+Os pop-ups de:
+
+- escala
+- paleta
+- controles
+
+possuem um `X` no topo para fechamento por mouse.
+Os atalhos antigos (`Esc`, `N`, `V`, `F11`) continuam valendo.
+
+### 14.8 Persistencia de controles
+
+Quando voce muda qualquer binding no menu `F11`, o projeto grava imediatamente:
+
+- `states/<rom>.controls`: configuracao da ROM atual
+- `states/global.controls`: configuracao global de fallback
+
+Carga ao iniciar:
+
+1. tenta `states/<rom>.controls`
+2. se nao existir, cai para `states/global.controls`
+
+Assim o remapeamento continua nas proximas sessoes sem precisar configurar de novo.
 
 ## 15. Arquitetura de suporte multithread (novos modulos)
 

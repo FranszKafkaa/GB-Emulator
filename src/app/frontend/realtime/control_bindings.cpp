@@ -176,6 +176,25 @@ bool saveControlBindings(const std::string& path, const ControlBindings& binding
     return static_cast<bool>(out);
 }
 
+bool loadControlBindingsWithFallback(const std::string& primaryPath, const std::string& fallbackPath, ControlBindings& out) {
+    if (loadControlBindings(primaryPath, out)) {
+        return true;
+    }
+    if (fallbackPath.empty()) {
+        return false;
+    }
+    return loadControlBindings(fallbackPath, out);
+}
+
+bool saveControlBindingsWithMirror(const std::string& primaryPath, const std::string& mirrorPath, const ControlBindings& bindings) {
+    const bool primaryOk = saveControlBindings(primaryPath, bindings);
+    if (mirrorPath.empty() || mirrorPath == primaryPath) {
+        return primaryOk;
+    }
+    const bool mirrorOk = saveControlBindings(mirrorPath, bindings);
+    return primaryOk && mirrorOk;
+}
+
 bool applyKeyboardBinding(gb::GameBoy& gb, const ControlBindings& bindings, int key, bool pressed) {
     for (std::size_t i = 0; i < kActionCount; ++i) {
         if (bindings.keys[i] != key) {

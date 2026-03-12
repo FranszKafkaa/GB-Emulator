@@ -121,17 +121,51 @@ void applyVideoFilterRgb24(VideoFilterMode mode, RgbFrame& pixels) {
     }
 }
 
-void drawFullscreenScaleMenu(SDL_Renderer* renderer, int outputW, int outputH, int selectedIndex) {
+PopupWindowLayout fullscreenScaleMenuLayout(int outputW, int outputH) {
     const int boxW = 460;
     const int boxH = 120;
     const int x = (outputW - boxW) / 2;
     const int y = (outputH - boxH) / 2;
+    return PopupWindowLayout{
+        SDL_Rect{x, y, boxW, boxH},
+        SDL_Rect{x + boxW - 20, y + 4, 14, 12},
+    };
+}
+
+PopupWindowLayout paletteModeMenuLayout(int outputW, int outputH, bool cgbSupported) {
+    const int itemCount = cgbSupported ? 3 : 2;
+    const int boxW = 460;
+    const int boxH = 78 + itemCount * 24;
+    const int x = (outputW - boxW) / 2;
+    const int y = (outputH - boxH) / 2;
+    return PopupWindowLayout{
+        SDL_Rect{x, y, boxW, boxH},
+        SDL_Rect{x + boxW - 20, y + 4, 14, 12},
+    };
+}
+
+bool popupLayoutHitClose(const PopupWindowLayout& layout, int px, int py) {
+    const SDL_Rect& r = layout.closeButton;
+    return px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h;
+}
+
+void drawFullscreenScaleMenu(SDL_Renderer* renderer, int outputW, int outputH, int selectedIndex) {
+    const auto layout = fullscreenScaleMenuLayout(outputW, outputH);
+    const int x = layout.box.x;
+    const int y = layout.box.y;
+    const int boxW = layout.box.w;
+    const int boxH = layout.box.h;
 
     SDL_SetRenderDrawColor(renderer, 10, 14, 24, 220);
-    SDL_Rect bg{x, y, boxW, boxH};
-    SDL_RenderFillRect(renderer, &bg);
+    SDL_RenderFillRect(renderer, &layout.box);
     SDL_SetRenderDrawColor(renderer, 90, 110, 150, 255);
-    SDL_RenderDrawRect(renderer, &bg);
+    SDL_RenderDrawRect(renderer, &layout.box);
+
+    SDL_SetRenderDrawColor(renderer, 28, 38, 62, 255);
+    SDL_RenderFillRect(renderer, &layout.closeButton);
+    SDL_SetRenderDrawColor(renderer, 96, 122, 170, 255);
+    SDL_RenderDrawRect(renderer, &layout.closeButton);
+    drawHexText(renderer, layout.closeButton.x + 4, layout.closeButton.y + 2, "X", SDL_Color{255, 228, 140, 255}, 1);
 
     drawHexText(renderer, x + 12, y + 8, "N MENU SCALE MODE", SDL_Color{235, 240, 255, 255}, 1);
 
@@ -151,21 +185,27 @@ void drawFullscreenScaleMenu(SDL_Renderer* renderer, int outputW, int outputH, i
         drawHexText(renderer, x + 14, y + 30 + i * 24, items[static_cast<std::size_t>(i)], color, 1);
     }
 
-    drawHexText(renderer, x + 12, y + boxH - 16, "UP DOWN ENTER N", SDL_Color{145, 156, 182, 255}, 1);
+    drawHexText(renderer, x + 12, y + boxH - 16, "UP DOWN ENTER N X", SDL_Color{145, 156, 182, 255}, 1);
 }
 
 void drawPaletteModeMenu(SDL_Renderer* renderer, int outputW, int outputH, int selectedIndex, bool cgbSupported) {
     const int itemCount = cgbSupported ? 3 : 2;
-    const int boxW = 460;
-    const int boxH = 78 + itemCount * 24;
-    const int x = (outputW - boxW) / 2;
-    const int y = (outputH - boxH) / 2;
+    const auto layout = paletteModeMenuLayout(outputW, outputH, cgbSupported);
+    const int x = layout.box.x;
+    const int y = layout.box.y;
+    const int boxW = layout.box.w;
+    const int boxH = layout.box.h;
 
     SDL_SetRenderDrawColor(renderer, 10, 14, 24, 220);
-    SDL_Rect bg{x, y, boxW, boxH};
-    SDL_RenderFillRect(renderer, &bg);
+    SDL_RenderFillRect(renderer, &layout.box);
     SDL_SetRenderDrawColor(renderer, 90, 110, 150, 255);
-    SDL_RenderDrawRect(renderer, &bg);
+    SDL_RenderDrawRect(renderer, &layout.box);
+
+    SDL_SetRenderDrawColor(renderer, 28, 38, 62, 255);
+    SDL_RenderFillRect(renderer, &layout.closeButton);
+    SDL_SetRenderDrawColor(renderer, 96, 122, 170, 255);
+    SDL_RenderDrawRect(renderer, &layout.closeButton);
+    drawHexText(renderer, layout.closeButton.x + 4, layout.closeButton.y + 2, "X", SDL_Color{255, 228, 140, 255}, 1);
 
     drawHexText(renderer, x + 12, y + 8, "V MENU PALETA", SDL_Color{235, 240, 255, 255}, 1);
 
@@ -186,7 +226,7 @@ void drawPaletteModeMenu(SDL_Renderer* renderer, int outputW, int outputH, int s
         drawHexText(renderer, x + 14, y + 30 + i * 24, items[static_cast<std::size_t>(i)], color, 1);
     }
 
-    drawHexText(renderer, x + 12, y + boxH - 16, "UP DOWN ENTER V ESC", SDL_Color{145, 156, 182, 255}, 1);
+    drawHexText(renderer, x + 12, y + boxH - 16, "UP DOWN ENTER V ESC X", SDL_Color{145, 156, 182, 255}, 1);
 }
 
 const std::array<std::array<unsigned char, 3>, 4>& monoPalette(DisplayPaletteMode mode) {

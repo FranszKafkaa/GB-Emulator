@@ -10,6 +10,7 @@
 #include "gb/app/frontend/realtime/replay_io.hpp"
 #include "gb/app/frontend/realtime/save_slots.hpp"
 #include "gb/app/frontend/realtime/timing_policy.hpp"
+#include "gb/app/frontend/realtime/top_menu.hpp"
 #include "gb/core/gameboy.hpp"
 
 #include "test_framework.hpp"
@@ -149,6 +150,37 @@ TEST_CASE("frontend", "control_bindings_save_load_apply") {
     T_REQUIRE(gb.joypad().state().pressed[4]);
 }
 
+TEST_CASE("frontend", "control_bindings_fallback_and_mirror") {
+    gb::frontend::ControlBindings bindings = gb::frontend::defaultControlBindings();
+    bindings.keys[2] = 2222;
+    bindings.padButtons[6] = 4444;
+
+    const auto primary = tests::makeTempPath("controls_primary", ".cfg");
+    const auto fallback = tests::makeTempPath("controls_fallback", ".cfg");
+    tests::ScopedPath cleanupPrimary(primary);
+    tests::ScopedPath cleanupFallback(fallback);
+
+    T_REQUIRE(gb::frontend::saveControlBindings(fallback.string(), bindings));
+
+    gb::frontend::ControlBindings loaded{};
+    T_REQUIRE(gb::frontend::loadControlBindingsWithFallback(primary.string(), fallback.string(), loaded));
+    T_EQ(loaded.keys[2], 2222);
+    T_EQ(loaded.padButtons[6], 4444);
+
+    bindings.keys[3] = 3333;
+    bindings.padButtons[1] = 1111;
+    T_REQUIRE(gb::frontend::saveControlBindingsWithMirror(primary.string(), fallback.string(), bindings));
+
+    gb::frontend::ControlBindings fromPrimary{};
+    gb::frontend::ControlBindings fromMirror{};
+    T_REQUIRE(gb::frontend::loadControlBindings(primary.string(), fromPrimary));
+    T_REQUIRE(gb::frontend::loadControlBindings(fallback.string(), fromMirror));
+    T_EQ(fromPrimary.keys[3], 3333);
+    T_EQ(fromMirror.keys[3], 3333);
+    T_EQ(fromPrimary.padButtons[1], 1111);
+    T_EQ(fromMirror.padButtons[1], 1111);
+}
+
 TEST_CASE("frontend", "link_endpoint_parser") {
     {
         const auto ep = gb::frontend::parseLinkEndpoint("127.0.0.1:7777");
@@ -195,4 +227,26 @@ TEST_CASE("frontend", "frame_timeline_keeps_fixed_size_and_navigation") {
     T_EQ(timeline.position(), timeline.size() - 1);
     T_REQUIRE(timeline.stepForward(gb));
     T_EQ(timeline.position(), timeline.size());
+}
+
+TEST_CASE("frontend", "top_menu_section_and_action_hit_test") {
+    const int outputW = 960;
+    const int yInBar = gb::frontend::topMenuBarHeight() / 2;
+
+    const auto section = gb::frontend::hitTestTopMenuSection(outputW, 16, yInBar);
+    T_REQUIRE(section.has_value());
+    T_EQ(static_cast<int>(section.value()), static_cast<int>(gb::frontend::TopMenuSection::Session));
+
+    const auto secRect = gb::frontend::topMenuSectionRect(outputW, gb::frontend::TopMenuSection::Image);
+    const auto imageHit = gb::frontend::hitTestTopMenuSection(outputW, secRect.x + 2, secRect.y + 2);
+    T_REQUIRE(imageHit.has_value());
+    T_EQ(static_cast<int>(imageHit.value()), static_cast<int>(gb::frontend::TopMenuSection::Image));
+
+    const auto drop = gb::frontend::topMenuDropdownRect(outputW, gb::frontend::TopMenuSection::Session);
+    const auto firstAction = gb::frontend::hitTestTopMenuAction(outputW, gb::frontend::TopMenuSection::Session, drop.x + 6, drop.y + 6);
+    T_REQUIRE(firstAction.has_value());
+    T_EQ(static_cast<int>(firstAction.value()), static_cast<int>(gb::frontend::TopMenuAction::TogglePause));
+
+    const auto outside = gb::frontend::hitTestTopMenuAction(outputW, gb::frontend::TopMenuSection::Session, drop.x - 2, drop.y - 2);
+    T_REQUIRE(!outside.has_value());
 }

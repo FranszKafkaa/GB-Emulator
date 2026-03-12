@@ -30,6 +30,8 @@ ControlBindings defaultControlBindings();
 
 bool loadControlBindings(const std::string& path, ControlBindings& out);
 bool saveControlBindings(const std::string& path, const ControlBindings& bindings);
+bool loadControlBindingsWithFallback(const std::string& primaryPath, const std::string& fallbackPath, ControlBindings& out);
+bool saveControlBindingsWithMirror(const std::string& primaryPath, const std::string& mirrorPath, const ControlBindings& bindings);
 
 bool applyKeyboardBinding(gb::GameBoy& gb, const ControlBindings& bindings, int key, bool pressed);
 bool applyGamepadBinding(gb::GameBoy& gb, const ControlBindings& bindings, int button, bool pressed);

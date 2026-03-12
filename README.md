@@ -101,8 +101,10 @@ rom/
 
 ### Estado e execucao
 
-- `F3` ou `Ctrl+S`: salvar save state
+- `Ctrl+S`: salvar save state
 - `F5` ou `Ctrl+L`: carregar save state
+- `F11`: menu de remapeamento de controles (teclado e controle)
+- `F3`: mostrar/ocultar barra superior
 - `L`: encerrar sessao atual e voltar ao menu de ROMs
 - `Left` (pausado): voltar 1 frame
 - `Right` (pausado): avancar 1 frame
@@ -134,6 +136,40 @@ rom/
 - `B`: breakpoint no `PC` atual
 - Clique em leitura de memoria: fixa watch
 - Clique em sprite da lista OAM: seleciona sprite + preview/overlay
+
+## Barra superior (SDL)
+
+Durante o jogo, uma barra no topo mostra **secoes clicaveis**:
+
+- `SESSAO`
+- `IMAGEM`
+- `DEBUG`
+- `CONTROLES`
+
+Cada secao abre um dropdown com acoes (pause, mute, save/load, fullscreen, filtro, debug, etc.).
+
+Comportamento da barra:
+
+- itens aparecem dinamicamente quando estao disponiveis (ex.: `MENU ESCALA` somente em fullscreen)
+- hover no mouse destaca secao e item
+- clique executa a acao
+- `F3` mostra/oculta a barra
+
+## Fechar janelas pop-up
+
+Menus pop-up (`Escala`, `Paleta`, `Controles`) agora exibem um botao `X` no canto superior direito:
+
+- clique no `X` para fechar
+- atalhos de teclado continuam funcionando normalmente
+
+## Persistencia de controles
+
+Ao alterar controles no menu `F11`, o emulador salva automaticamente para futuras sessoes:
+
+- `states/<rom>.controls` (perfil da ROM atual)
+- `states/global.controls` (fallback global)
+
+No inicio da sessao, ele carrega primeiro o perfil da ROM; se nao existir, usa o global.
 
 ## Persistencia
 
