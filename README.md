@@ -7,7 +7,7 @@ O projeto tem foco em legibilidade, arquitetura modular e ferramentas de debug e
 
 ## Documentacao
 
-- Guia completo (leigo): `docs/guia.md`
+- Guia completo: `docs/guia.md`
 - Formato da suite de ROMs: `docs/rom-suite.md`
 
 ## Build
