@@ -1084,3 +1084,157 @@ Melhorias aplicadas na CPU ARM7TDMI para reduzir travamentos com tela preta e co
 
 Observacao importante:
 - O fluxo GBA ainda e experimental e alguns titulos podem continuar exigindo ajustes finos de IRQ/PPU para compatibilidade total.
+
+## 24. Correcao recente (IRQ stack leak no GBA)
+
+Foi corrigido um problema de compatibilidade que podia quebrar retornos de funcao (ex.: `POP {r0}; BX r0`) em jogos como Advance Wars:
+
+- O dispatcher de IRQ voltou a colocar a marca de retorno na stack de IRQ (necessario para handlers THUMB).
+- Agora a CPU salva o `SP` original da bank IRQ (`irqEntrySp_`) e restaura esse valor no retorno do trampolim.
+- Com isso, a stack de IRQ nao fica descendo a cada interrupcao e nao sobrescreve stack de codigo comum.
+- Tambem foi mantido `r0 = 0x04000000` ao entrar no handler, seguindo a ABI esperada por varios handlers.
+- O core agora suporta IRQ aninhada com pilha de contextos (nao apenas 1 contexto global):
+  - cada entrada de IRQ salva `regs/cpsr/pc de retorno/sp da bank IRQ`
+  - cada retorno por trampolim desempilha exatamente 1 contexto
+  - isso evita perda de contexto quando uma IRQ ocorre durante outra IRQ
+- Decoder ARM corrigido para reduzir corrupcao silenciosa:
+  - suporte a `UMULL/UMLAL/SMULL/SMLAL`
+  - suporte a `SWP/SWPB`
+  - `halfword transfer` agora nao captura instrucoes de multiply/swap por engano
+  - instrucoes reservadas de halfword nao sao mais tratadas como sucesso falso
+- PPU melhorada para aproximar compatibilidade de jogos:
+  - suporte a `OBJ Window` (mascara via byte alto de `WINOUT`)
+  - geracao de mascara OBJWIN por pixel com base real em OAM/VRAM (sprites em mode2)
+  - aplicacao da mascara OBJWIN em BG/OBJ/color effects no pipeline de render
+  - novo teste de regressao: `gba_ppu_obj_window_uses_winout_upper_mask`
+
+## 25. Correcao recente (glitch visual por SWI RLUnComp)
+
+Foi corrigido um bug na descompressao RLE da BIOS HLE (`SWI 0x14`/`SWI 0x15`) que podia gerar tiles/blocos corrompidos em jogos GBA:
+
+- Causa raiz:
+  - em blocos comprimidos do formato RL, o tamanho correto e `len = (controle & 0x7F) + 3`
+  - a implementacao estava usando `+1` tambem para blocos comprimidos
+- Efeito pratico:
+  - dados descomprimidos ficavam truncados/errados
+  - texturas e mapas podiam aparecer com artefatos em "mosaico" ou tiles embaralhados
+- Correcao aplicada:
+  - `runRlUnComp()` agora usa `+3` para blocos comprimidos e mantem `+1` para blocos literais
+- Cobertura de teste adicionada:
+  - `gba_swi_rluncomp_wram_uses_compressed_length_plus_three`
+  - `gba_swi_rluncomp_vram_packs_bytes_in_halfwords`
+
+## 26. Ajuste recente na PPU GBA (raster/affine por linha)
+
+Para reduzir artefatos em cenas que alteram registradores affine durante o frame:
+
+- A PPU agora captura snapshots por scanline dos registradores affine de BG2/BG3:
+  - `PA/PB/PC/PD`
+  - `BGxX/BGxY` (com leitura em formato signed 28-bit, como no hardware)
+- Esses snapshots sao usados no `renderAffineBackground()` para montar coordenadas por linha, em vez de usar apenas um unico conjunto de registradores do fim do frame.
+- Isso melhora compatibilidade com efeitos tipo raster/HBlank em jogos GBA.
+
+## 27. Ajuste recente de sincronismo de frame no GBA
+
+O loop de frame do `System` foi melhorado para ficar alinhado com a PPU:
+
+- Antes:
+  - `runFrame()` executava um numero fixo de instrucoes (`70000`) e renderizava
+  - isso podia capturar estado de VRAM no meio de atualizacoes internas do jogo
+- Agora:
+  - `runFrame()` roda CPU/PPU ate detectar wrap de scanline (`LY` volta de `227` para `0`)
+  - a renderizacao ocorre em um ponto de frame mais estavel
+- Efeito esperado:
+  - menos artefato visual intermitente em cenas que atualizam BG/tiles com timing sensivel
+
+Atualizacao de desempenho:
+
+- O modo padrao voltou para execucao por frame nominal (`70224` instrucoes), que e mais rapido.
+- O modo de sincronismo por wrap de scanline virou opcional via variavel de ambiente:
+  - `GBEMU_GBA_FRAME_SYNC_SCANLINE=1`
+  - use esse modo se precisar priorizar estabilidade visual em titulos especificos.
+
+## 28. Otimizacao recente no hot path da CPU GBA
+
+Foi aplicada uma melhoria de desempenho relevante no `CpuArm7tdmi`:
+
+- Antes: o loop de `step()` fazia varias chamadas `std::getenv(...)` por instrucao para checar logs.
+- Agora:
+  - as flags de log sao lidas uma vez no `reset()` (`refreshLogFlags()`)
+  - o hot path usa booleans em memoria (`logFlags_.*`)
+- Resultado:
+  - reduz custo por instrucao
+  - melhora FPS no modo GBA sem alterar comportamento funcional quando logs estao desligados.
+
+## 29. Otimizacao recente na PPU GBA (window mask fast path)
+
+A PPU agora evita trabalho desnecessario quando janelas de hardware (WIN0/WIN1/OBJWIN) nao estao habilitadas:
+
+- Antes:
+  - chamadas de `windowMaskForPixel(x, y)` eram feitas para muitos pixels, mesmo sem janelas ativas
+- Agora:
+  - quando nao ha janelas ativas, usa mascara fixa `0x3F` direto
+  - evita funcoes e leituras extras no caminho quente de render
+- Efeito:
+  - ganho de desempenho no render GBA, principalmente em cenas comuns sem window effects.
+
+## 30. Compatibilidade GBA: backend de backup (SRAM/FLASH/EEPROM)
+
+Foi implementado um backend de backup mais completo no core GBA, focado em destravar boot e saves de mais jogos:
+
+- Deteccao automatica por assinatura na ROM:
+  - `SRAM_V*` / `SRAM_F_V*` -> SRAM
+  - `FLASH_V*` / `FLASH512_V*` -> Flash 64 KiB
+  - `FLASH1M_V*` -> Flash 128 KiB (banked)
+  - `EEPROM_V*` -> EEPROM serial
+- Mapeamento funcional de backup:
+  - SRAM/Flash em `0x0E000000`
+  - EEPROM serial em `0x0Dxxxxxx` (bitstream por halfword, como usado por DMA)
+- Flash com comandos principais:
+  - unlock (`AA 55`), `A0` (program), `90/F0` (ID on/off), `80` + sequencia de erase, `B0` (bank switch no 1M)
+- EEPROM com fluxo de comando:
+  - write/read por bits
+  - deteccao automatica de modo 6-bit/14-bit pelo tamanho do comando
+  - fila de retorno com 4 dummy bits + 64 bits de dados
+- Persistencia em arquivo para GBA:
+  - `main` agora carrega e grava automaticamente `states/<rom>.sav` tambem no fluxo GBA
+  - mensagens no terminal indicam tipo de backup e caminho do save
+
+Impacto pratico:
+- ROMs que travavam na inicializacao por falta de emulacao de backup (como `Super Mario Advance 2`) passam a avançar melhor.
+- Saves internos de jogos GBA agora persistem entre sessoes no mesmo formato `.sav` usado no projeto.
+
+## 31. Modo de compatibilidade automatica por ROM (game code)
+
+Foi adicionado um perfil de compatibilidade automatico, aplicado no carregamento da ROM GBA:
+
+- O `System` agora monta um `CompatibilityProfile` a partir do `game code` do header.
+- Esse perfil controla ajustes sem o usuario precisar configurar manualmente.
+- O frontend mostra no log:
+  - `perfil de compatibilidade: <nome>`
+
+Perfis iniciais implementados:
+
+- `AA2E` (Super Mario Advance 2):
+  - usa estrategia dinamica de EEPROM (sem travar em 6/14 bits fixo)
+  - mantem parametros de timing em modo auto
+- `AWRE` (Advance Wars):
+  - ativa modo de compatibilidade de FLASH (backend simplificado 8-bit) para evitar travas em rotinas de init de save
+
+Se nenhuma ROM casar com um perfil conhecido:
+- usa `default` (comportamento padrao do emulador)
+- `fallback` adaptativo pode ativar sincronismo por scanline automaticamente se o jogo ficar muitos frames sem configurar display no boot.
+
+## 32. Correcao do aviso \"Your saved data is corrupt\" no Mario Advance 2
+
+O aviso acontecia principalmente quando existia `.sav` legado com formato incompativel ou quando a largura de endereco EEPROM era inferida de forma errada.
+
+Ajustes aplicados:
+
+- O parser EEPROM passou a usar o tamanho real da transferencia DMA (`9/17/73/81`) para decidir 6-bit ou 14-bit de forma dinamica.
+- O carregamento de `.sav` EEPROM tambem usa heuristica por tamanho de arquivo (512 ou 8192 bytes), para migrar saves legados.
+- O save e persistido no tamanho coerente com o modo EEPROM efetivo da sessao.
+- Para jogos com FLASH sensiveis ao protocolo, foi adicionado modo de compatibilidade de escrita/leitura direta por byte no barramento de backup.
+
+Resultado:
+- reduz fortemente falsos positivos de save corrompido e melhora compatibilidade entre jogos EEPROM diferentes.

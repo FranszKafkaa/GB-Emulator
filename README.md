@@ -27,7 +27,17 @@ cmake -S . -B build -DGBEMU_USE_SDL2=ON
 cmake --build build -j
 ```
 
-Sem SDL2, o executavel ainda funciona em modo headless.
+Se SDL2 nao for encontrado, o build continua em modo headless automaticamente.
+
+### Windows (PowerShell)
+
+```powershell
+cmake -S . -B build -G "Ninja" -DGBEMU_USE_SDL2=ON
+cmake --build build --config Release
+.\build\gbemu.exe
+```
+
+Sem SDL2 instalado no Windows, o executavel tambem sera gerado (headless).
 
 ## Como rodar
 

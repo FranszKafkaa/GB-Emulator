@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <fstream>
 #include <iterator>
 
@@ -67,6 +68,22 @@ u16 rgbTo565(u8 r, u8 g, u8 b) {
     return static_cast<u16>((r5 << 11) | (g6 << 5) | b5);
 }
 
+CompatibilityProfile resolveCompatibilityProfileForGame(const std::string& gameCode) {
+    CompatibilityProfile profile{};
+    if (gameCode == "AA2E") {
+        // Super Mario Advance 2: usa caminho dinamico de EEPROM para evitar falso-positivo de save corrompido.
+        profile.name = "super-mario-advance-2";
+        return profile;
+    }
+    if (gameCode == "AWRE") {
+        // Advance Wars: backend flash simplificado evita travas no boot em implementacoes incompletas.
+        profile.name = "advance-wars";
+        profile.useFlashCompatibilityMode = true;
+        return profile;
+    }
+    return profile;
+}
+
 } // namespace
 
 bool System::loadRomFromFile(const std::string& path) {
@@ -85,10 +102,18 @@ bool System::loadRomFromFile(const std::string& path) {
     romPath_ = path;
     romData_ = std::move(data);
     frameCounter_ = 0;
+    adaptiveScanlineSync_ = false;
+    startupNoDisplayFrames_ = 0;
     refreshMetadata();
+    configureCompatibilityProfile();
     if (!memory_.loadRom(romData_)) {
         return false;
     }
+    memory_.configureBackupBehavior(
+        compatibilityProfile_.forcedEepromAddressBits,
+        compatibilityProfile_.strictBackupFileSize
+    );
+    memory_.setFlashCompatibilityMode(compatibilityProfile_.useFlashCompatibilityMode);
     ppu_.connectMemory(&memory_);
     ppu_.reset();
     cpu_.connectMemory(&memory_);
@@ -112,6 +137,26 @@ const RomMetadata& System::metadata() const {
 
 bool System::loaded() const {
     return !romData_.empty();
+}
+
+bool System::hasPersistentBackup() const {
+    return memory_.hasPersistentBackup();
+}
+
+const std::string& System::backupTypeName() const {
+    return memory_.backupTypeName();
+}
+
+const CompatibilityProfile& System::compatibilityProfile() const {
+    return compatibilityProfile_;
+}
+
+bool System::loadBackupFromFile(const std::string& path) {
+    return memory_.loadBackupFromFile(path);
+}
+
+bool System::saveBackupToFile(const std::string& path) const {
+    return memory_.saveBackupToFile(path);
 }
 
 const std::array<u16, System::FramebufferSize>& System::framebuffer() const {
@@ -140,6 +185,8 @@ CpuArm7tdmi& System::cpu() {
 
 void System::reset() {
     frameCounter_ = 0;
+    adaptiveScanlineSync_ = false;
+    startupNoDisplayFrames_ = 0;
     memory_.reset();
     ppu_.connectMemory(&memory_);
     ppu_.reset();
@@ -155,8 +202,50 @@ void System::runFrame() {
     }
 
     ++frameCounter_;
-    constexpr int kInstructionsPerFrame = 70000;
-    runInstructions(kInstructionsPerFrame);
+    if (compatibilityProfile_.enableAdaptiveScanlineFallback && frameCounter_ <= 600U) {
+        const u16 dispcnt = memory_.readIo16(0U);
+        if ((dispcnt & 0x0080U) != 0U || (dispcnt & 0x0007U) == 0U) {
+            ++startupNoDisplayFrames_;
+        } else {
+            startupNoDisplayFrames_ = 0;
+        }
+        if (startupNoDisplayFrames_ >= 180) {
+            adaptiveScanlineSync_ = true;
+        }
+    }
+
+    bool frameSyncScanline = compatibilityProfile_.forceScanlineFrameSync || adaptiveScanlineSync_;
+    if (const char* env = std::getenv("GBEMU_GBA_FRAME_SYNC_SCANLINE")) {
+        frameSyncScanline = env[0] != '0';
+    }
+    if (!frameSyncScanline) {
+        // Modo padrao: prioriza desempenho (aprox. 280896 bus cycles/frame).
+        constexpr int kNominalInstructionsPerFrame = 70224;
+        runInstructions(kNominalInstructionsPerFrame);
+    } else {
+        // Modo opcional de compatibilidade visual: sincroniza no wrap de scanline.
+        constexpr int kMaxInstructionsPerFrame = 300000;
+        bool wrappedScanline = false;
+        for (int i = 0; i < kMaxInstructionsPerFrame; ++i) {
+            const std::uint16_t previousLine = ppu_.scanline();
+            const int cpuCycles = cpu_.step();
+            if (cpuCycles <= 0) {
+                break;
+            }
+            const int busCycles = cpuCycles * 4;
+            memory_.step(busCycles);
+            ppu_.step(busCycles);
+            const std::uint16_t currentLine = ppu_.scanline();
+            if (currentLine < previousLine) {
+                wrappedScanline = true;
+                break;
+            }
+        }
+        if (!wrappedScanline) {
+            // Fallback defensivo para nao travar caso algo interrompa o wrap normal.
+            runInstructions(2000);
+        }
+    }
     renderExecutionFrame();
 }
 
@@ -234,6 +323,10 @@ void System::refreshMetadata() {
     }
     const u8 expected = static_cast<u8>(0U - static_cast<u8>(0x19U + sum));
     metadata_.validHeaderChecksum = expected == metadata_.complementCheck;
+}
+
+void System::configureCompatibilityProfile() {
+    compatibilityProfile_ = resolveCompatibilityProfileForGame(metadata_.gameCode);
 }
 
 void System::renderBootstrapFrame() {

@@ -1,7 +1,7 @@
 #include "gb/app/frontend/gba_realtime.hpp"
 
 #ifdef GBEMU_USE_SDL2
-#include <SDL2/SDL.h>
+#include "gb/app/sdl_compat.hpp"
 
 #include <algorithm>
 #include <string>

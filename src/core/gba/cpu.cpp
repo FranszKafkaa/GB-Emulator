@@ -15,6 +15,7 @@ constexpr u32 kCpsrN = 1U << 31U;
 constexpr u32 kCpsrZ = 1U << 30U;
 constexpr u32 kCpsrC = 1U << 29U;
 constexpr u32 kCpsrV = 1U << 28U;
+constexpr u32 kCpsrF = 1U << 6U;
 constexpr u32 kCpsrI = 1U << 7U;
 constexpr u32 kCpsrT = 1U << 5U;
 constexpr u32 kCpsrModeMask = 0x1FU;
@@ -33,10 +34,15 @@ constexpr u32 kPsrByteMaskExtension = 0x0000FF00U;
 constexpr u32 kPsrByteMaskStatus = 0x00FF0000U;
 constexpr u32 kPsrByteMaskFlags = 0xFF000000U;
 constexpr u32 kIrqReturnTrampoline = 0xFFFF0010U;
+constexpr u32 kVectorUndefined = 0x00000004U;
+constexpr u32 kVectorPrefetchAbort = 0x0000000CU;
 constexpr double kTwoPi = 6.2831853071795864769;
 
 bool isValidExecuteAddress(u32 address) {
     const u8 region = static_cast<u8>(address >> 24U);
+    if (region == 0x00U) {
+        return address < 0x00004000U;
+    }
     return region == 0x02U || region == 0x03U || (region >= 0x08U && region <= 0x0DU);
 }
 
@@ -117,8 +123,8 @@ void runRlUnComp(Memory& memory, u32 src, u32 dst, bool vramMode) {
     u32 written = 0;
     while (written < outputSize) {
         const u8 block = memory.read8(src++);
-        const u32 count = static_cast<u32>(block & 0x7FU) + 1U;
         if ((block & 0x80U) != 0U) {
+            const u32 count = static_cast<u32>(block & 0x7FU) + 3U;
             const u8 value = memory.read8(src++);
             for (u32 i = 0; i < count && written < outputSize; ++i) {
                 decoded[written] = value;
@@ -126,6 +132,7 @@ void runRlUnComp(Memory& memory, u32 src, u32 dst, bool vramMode) {
             }
             continue;
         }
+        const u32 count = static_cast<u32>(block & 0x7FU) + 1U;
         for (u32 i = 0; i < count && written < outputSize; ++i) {
             decoded[written] = memory.read8(src++);
             ++written;
@@ -140,6 +147,16 @@ void CpuArm7tdmi::connectMemory(Memory* memory) {
     memory_ = memory;
 }
 
+void CpuArm7tdmi::refreshLogFlags() {
+    logFlags_.badPc = std::getenv("GBEMU_GBA_LOG_BAD_PC") != nullptr;
+    logFlags_.biosExec = std::getenv("GBEMU_GBA_LOG_BIOS_EXEC") != nullptr;
+    logFlags_.unknown = std::getenv("GBEMU_GBA_LOG_UNKNOWN") != nullptr;
+    logFlags_.armWindow = std::getenv("GBEMU_GBA_LOG_ARM_WINDOW") != nullptr;
+    logFlags_.stateSwitch = std::getenv("GBEMU_GBA_LOG_STATE_SWITCH") != nullptr;
+    logFlags_.bl = std::getenv("GBEMU_GBA_LOG_BL") != nullptr;
+    logFlags_.swi = std::getenv("GBEMU_GBA_LOG_SWI") != nullptr;
+}
+
 void CpuArm7tdmi::reset() {
     regs_.fill(0);
     userBank_ = BankedRegisters{};
@@ -148,6 +165,8 @@ void CpuArm7tdmi::reset() {
     abtBank_ = BankedRegisters{};
     undBank_ = BankedRegisters{};
     fiqBank_ = BankedRegisters{};
+    sharedR8ToR12_.fill(0);
+    fiqR8ToR12_.fill(0);
 
     // Padroes praticos usados pela inicializacao tipica de jogos GBA.
     userBank_.sp = 0x03007F00U;
@@ -156,10 +175,10 @@ void CpuArm7tdmi::reset() {
 
     cpsr_ = kModeSystem;
     loadModeBank(kModeSystem);
-    irqSavedRegs_.fill(0);
-    irqSavedCpsr_ = 0;
-    irqResumeAddress_ = 0;
-    irqDispatchActive_ = false;
+    for (auto& context : irqContextStack_) {
+        context = IrqContext{};
+    }
+    irqContextDepth_ = 0;
     executedInstructions_ = 0;
     halted_ = false;
     waitingForInterrupt_ = false;
@@ -167,6 +186,7 @@ void CpuArm7tdmi::reset() {
     lastExecutablePc_ = ResetPc;
     thumbBlPrefixPending_ = false;
     thumbBlPrefixValue_ = 0;
+    refreshLogFlags();
     regs_[15] = ResetPc;
 }
 
@@ -178,30 +198,13 @@ int CpuArm7tdmi::step() {
     alignPcForCurrentState();
     const u32 executeAddressMask = thumbMode() ? ~1U : ~3U;
     if (!isValidExecuteAddress(regs_[15] & executeAddressMask)) {
-        const u32 blockedPc = regs_[15];
-        if (blockedPc <= 0x00004000U && isValidExecuteAddress(regs_[14] & ~1U)) {
-            // BIOS indisponivel: alguns fluxos acabam chamando ponteiro nulo e caindo em 0x0.
-            // Para nao travar em tela preta, retorna para LR quando houver um retorno plausivel.
-            setThumbMode((regs_[14] & 1U) != 0U);
-            regs_[15] = regs_[14];
-            alignPcForCurrentState();
-        } else {
-            const bool recoverThumb = thumbMode();
-            const u32 stepSize = recoverThumb ? 2U : 4U;
-            u32 recoveryPc = lastExecutablePc_ + stepSize;
-            if (!isValidExecuteAddress(recoveryPc & (recoverThumb ? ~1U : ~3U))) {
-                recoveryPc = ResetPc;
-                setThumbMode(false);
-            }
-            regs_[15] = recoveryPc;
-            alignPcForCurrentState();
-        }
+        const u32 blockedPc = regs_[15] & executeAddressMask;
+        enterPrefetchAbortException(blockedPc);
         waitingForInterrupt_ = false;
         waitingInterruptMask_ = 0U;
-        halted_ = false;
-        if (std::getenv("GBEMU_GBA_LOG_BAD_PC") != nullptr) {
+        if (logFlags_.badPc) {
             std::cerr << "[GBA][CPU] blocked execute pc=0x" << std::hex << blockedPc
-                      << " recovered=0x" << regs_[15]
+                      << " vector=0x" << regs_[15]
                       << " cpsr=0x" << cpsr_ << std::dec << '\n';
         }
         ++executedInstructions_;
@@ -235,7 +238,7 @@ int CpuArm7tdmi::step() {
 
     if (thumbMode()) {
         const u32 currentPc = regs_[15];
-        if (std::getenv("GBEMU_GBA_LOG_BIOS_EXEC") != nullptr && currentPc < 0x00004000U) {
+        if (logFlags_.biosExec && currentPc < 0x00004000U) {
             static std::uint64_t biosThumbCount = 0;
             if (biosThumbCount < 128U) {
                 ++biosThumbCount;
@@ -249,15 +252,19 @@ int CpuArm7tdmi::step() {
         const u16 instruction = memory_->read16(currentPc);
         regs_[15] = currentPc + 2U;
         const bool executedThumb = executeThumbInstruction(instruction, currentPc);
-        if (!executedThumb && std::getenv("GBEMU_GBA_LOG_UNKNOWN") != nullptr) {
-            static std::uint64_t unknownThumbCount = 0;
-            if (unknownThumbCount < 64U) {
-                ++unknownThumbCount;
-                std::cerr << "[GBA][CPU] unknown THUMB op=0x" << std::hex << instruction
-                          << " pc=0x" << currentPc << " cpsr=0x" << cpsr_ << std::dec << '\n';
+        if (!executedThumb) {
+            if (logFlags_.unknown) {
+                static std::uint64_t unknownThumbCount = 0;
+                if (unknownThumbCount < 64U) {
+                    ++unknownThumbCount;
+                    std::cerr << "[GBA][CPU] unknown THUMB op=0x" << std::hex << instruction
+                              << " pc=0x" << currentPc << " cpsr=0x" << cpsr_ << std::dec << '\n';
+                }
             }
+            // THUMB undefined instruction: retorno esperado via LR_und + estado em SPSR_und.
+            enterUndefinedException(currentPc + 2U);
         }
-        if (std::getenv("GBEMU_GBA_LOG_BAD_PC") != nullptr
+        if (logFlags_.badPc
             && regs_[15] < 0x00004000U
             && currentPc >= 0x02000000U) {
             std::cerr << "[GBA][CPU] low-target THUMB op=0x" << std::hex << instruction
@@ -267,7 +274,7 @@ int CpuArm7tdmi::step() {
                       << " cpsr=0x" << cpsr_
                       << std::dec << '\n';
         }
-        if (std::getenv("GBEMU_GBA_LOG_BAD_PC") != nullptr) {
+        if (logFlags_.badPc) {
             const u32 pc = regs_[15];
             if (!isValidExecuteAddress(pc & ~1U)) {
                 std::cerr << "[GBA][CPU] bad PC after THUMB op=0x" << std::hex << instruction
@@ -282,7 +289,7 @@ int CpuArm7tdmi::step() {
     }
 
     const u32 currentPc = regs_[15];
-    if (std::getenv("GBEMU_GBA_LOG_BIOS_EXEC") != nullptr && currentPc < 0x00004000U) {
+    if (logFlags_.biosExec && currentPc < 0x00004000U) {
         static std::uint64_t biosArmCount = 0;
         if (biosArmCount < 128U) {
             ++biosArmCount;
@@ -295,7 +302,7 @@ int CpuArm7tdmi::step() {
     }
     const u32 instruction = memory_->read32(currentPc);
     regs_[15] = currentPc + 4U;
-    if (std::getenv("GBEMU_GBA_LOG_ARM_WINDOW") != nullptr
+    if (logFlags_.armWindow
         && currentPc >= 0x03005260U
         && currentPc <= 0x030052A0U) {
         std::cerr << "[GBA][CPU] arm-window pc=0x" << std::hex << currentPc
@@ -321,6 +328,8 @@ int CpuArm7tdmi::step() {
         executed = true;
     } else if (executeMultiply(instruction)) {
         executed = true;
+    } else if (executeSwap(instruction)) {
+        executed = true;
     } else if (executeHalfwordDataTransfer(instruction)) {
         executed = true;
     } else if (executeSingleDataTransfer(instruction)) {
@@ -331,15 +340,19 @@ int CpuArm7tdmi::step() {
         executed = true;
     }
 
-    if (!executed && std::getenv("GBEMU_GBA_LOG_UNKNOWN") != nullptr) {
-        static std::uint64_t unknownArmCount = 0;
-        if (unknownArmCount < 64U) {
-            ++unknownArmCount;
-            std::cerr << "[GBA][CPU] unknown ARM op=0x" << std::hex << instruction
-                      << " pc=0x" << currentPc << " cpsr=0x" << cpsr_ << std::dec << '\n';
+    if (!executed) {
+        if (logFlags_.unknown) {
+            static std::uint64_t unknownArmCount = 0;
+            if (unknownArmCount < 64U) {
+                ++unknownArmCount;
+                std::cerr << "[GBA][CPU] unknown ARM op=0x" << std::hex << instruction
+                          << " pc=0x" << currentPc << " cpsr=0x" << cpsr_ << std::dec << '\n';
+            }
         }
+        // ARM undefined instruction retorna via MOVS pc, lr (LR_und = endereco da proxima instrucao).
+        enterUndefinedException(currentPc + 4U);
     }
-    if (std::getenv("GBEMU_GBA_LOG_BAD_PC") != nullptr
+    if (logFlags_.badPc
         && regs_[15] < 0x00004000U
         && currentPc >= 0x02000000U) {
         std::cerr << "[GBA][CPU] low-target ARM op=0x" << std::hex << instruction
@@ -349,7 +362,7 @@ int CpuArm7tdmi::step() {
                   << " cpsr=0x" << cpsr_
                   << std::dec << '\n';
     }
-    if (std::getenv("GBEMU_GBA_LOG_BAD_PC") != nullptr) {
+    if (logFlags_.badPc) {
         const u32 pc = regs_[15];
         if (!isValidExecuteAddress(pc & ~3U)) {
             std::cerr << "[GBA][CPU] bad PC after ARM op=0x" << std::hex << instruction
@@ -412,7 +425,7 @@ bool CpuArm7tdmi::thumbMode() const {
 void CpuArm7tdmi::setThumbMode(bool enabled) {
     const bool previous = thumbMode();
     setFlag(kCpsrT, enabled);
-    if (std::getenv("GBEMU_GBA_LOG_STATE_SWITCH") != nullptr && previous != enabled) {
+    if (logFlags_.stateSwitch && previous != enabled) {
         std::cerr << "[GBA][CPU] state-switch " << (previous ? "THUMB" : "ARM")
                   << " -> " << (enabled ? "THUMB" : "ARM")
                   << " pc=0x" << std::hex << regs_[15]
@@ -461,8 +474,81 @@ bool CpuArm7tdmi::modeUsesUserBank(u32 mode) {
     return mode == kModeUser || mode == kModeSystem;
 }
 
+u32 CpuArm7tdmi::readArmRegister(std::size_t index, bool forStore) const {
+    index &= 0x0FU;
+    if (index != 15U) {
+        return regs_[index];
+    }
+    // Durante execucao ARM, regs_[15] ja aponta para current+4.
+    // Leituras de R15 observam current+8; stores usam current+12.
+    return regs_[15] + (forStore ? 8U : 4U);
+}
+
+u32 CpuArm7tdmi::readUserBankRegister(std::size_t index) const {
+    index &= 0x0FU;
+    const u32 mode = cpsr_ & kCpsrModeMask;
+    if (index <= 7U) {
+        return regs_[index];
+    }
+    if (index <= 12U) {
+        if (mode == kModeFiq) {
+            return sharedR8ToR12_[index - 8U];
+        }
+        return regs_[index];
+    }
+    if (index == 13U) {
+        return modeUsesUserBank(mode) ? regs_[13] : userBank_.sp;
+    }
+    if (index == 14U) {
+        return modeUsesUserBank(mode) ? regs_[14] : userBank_.lr;
+    }
+    return readArmRegister(15U, true);
+}
+
+void CpuArm7tdmi::writeUserBankRegister(std::size_t index, u32 value) {
+    index &= 0x0FU;
+    const u32 mode = cpsr_ & kCpsrModeMask;
+    if (index <= 7U) {
+        regs_[index] = value;
+        return;
+    }
+    if (index <= 12U) {
+        if (mode == kModeFiq) {
+            sharedR8ToR12_[index - 8U] = value;
+            return;
+        }
+        regs_[index] = value;
+        sharedR8ToR12_[index - 8U] = value;
+        return;
+    }
+    if (index == 13U) {
+        userBank_.sp = value;
+        if (modeUsesUserBank(mode)) {
+            regs_[13] = value;
+        }
+        return;
+    }
+    if (index == 14U) {
+        userBank_.lr = value;
+        if (modeUsesUserBank(mode)) {
+            regs_[14] = value;
+        }
+        return;
+    }
+    regs_[15] = value;
+}
+
 void CpuArm7tdmi::saveModeBank(u32 mode) {
     mode &= kCpsrModeMask;
+    if (mode == kModeFiq) {
+        for (std::size_t i = 0; i < fiqR8ToR12_.size(); ++i) {
+            fiqR8ToR12_[i] = regs_[8U + i];
+        }
+    } else {
+        for (std::size_t i = 0; i < sharedR8ToR12_.size(); ++i) {
+            sharedR8ToR12_[i] = regs_[8U + i];
+        }
+    }
     if (modeUsesUserBank(mode)) {
         userBank_.sp = regs_[13];
         userBank_.lr = regs_[14];
@@ -496,6 +582,15 @@ void CpuArm7tdmi::saveModeBank(u32 mode) {
 
 void CpuArm7tdmi::loadModeBank(u32 mode) {
     mode &= kCpsrModeMask;
+    if (mode == kModeFiq) {
+        for (std::size_t i = 0; i < fiqR8ToR12_.size(); ++i) {
+            regs_[8U + i] = fiqR8ToR12_[i];
+        }
+    } else {
+        for (std::size_t i = 0; i < sharedR8ToR12_.size(); ++i) {
+            regs_[8U + i] = sharedR8ToR12_[i];
+        }
+    }
     if (modeUsesUserBank(mode)) {
         regs_[13] = userBank_.sp;
         regs_[14] = userBank_.lr;
@@ -621,6 +716,32 @@ void CpuArm7tdmi::alignPcForCurrentState() {
     }
 }
 
+void CpuArm7tdmi::enterException(u32 newMode, u32 vectorAddress, u32 lrValue, bool maskIrq, bool maskFiq) {
+    const u32 oldCpsr = cpsr_;
+    switchMode(newMode);
+    writeSpsr(oldCpsr);
+    regs_[14] = lrValue;
+    if (maskIrq) {
+        setFlag(kCpsrI, true);
+    }
+    if (maskFiq) {
+        setFlag(kCpsrF, true);
+    }
+    setThumbMode(false);
+    regs_[15] = vectorAddress;
+    alignPcForCurrentState();
+    thumbBlPrefixPending_ = false;
+    halted_ = false;
+}
+
+void CpuArm7tdmi::enterUndefinedException(u32 lrValue) {
+    enterException(kModeUndefined, kVectorUndefined, lrValue, true, false);
+}
+
+void CpuArm7tdmi::enterPrefetchAbortException(u32 faultAddress) {
+    enterException(kModeAbort, kVectorPrefetchAbort, faultAddress + 4U, true, false);
+}
+
 bool CpuArm7tdmi::conditionPassed(u8 cond) const {
     switch (cond & 0x0FU) {
     case 0x0: // EQ
@@ -673,16 +794,10 @@ u32 CpuArm7tdmi::readOperand2(u32 instruction, bool& shifterCarry) {
     }
 
     const std::size_t rmIndex = static_cast<std::size_t>(instruction & 0x0FU);
-    u32 rm = regs_[rmIndex];
-    if (rmIndex == 15U) {
-        rm += 4U; // PC observado pelas instrucoes ARM = endereco atual + 8.
-    }
+    u32 rm = readArmRegister(rmIndex);
     if ((instruction & (1U << 4U)) != 0U) {
         const std::size_t rsIndex = static_cast<std::size_t>((instruction >> 8U) & 0x0FU);
-        u32 rs = regs_[rsIndex];
-        if (rsIndex == 15U) {
-            rs += 4U;
-        }
+        u32 rs = readArmRegister(rsIndex);
         const unsigned amount = static_cast<unsigned>(rs & 0xFFU);
         const unsigned shiftType = static_cast<unsigned>((instruction >> 5U) & 0x03U);
 
@@ -1040,9 +1155,6 @@ bool CpuArm7tdmi::executeThumbInstruction(u16 instruction, u32 currentPc) {
             regs_[rd] = rdValue + rsValue;
             if (rd == 15U) {
                 regs_[15] &= ~1U;
-                if (!isValidExecuteAddress(regs_[15])) {
-                    regs_[15] = currentPc + 2U;
-                }
             }
             return true;
         }
@@ -1055,9 +1167,6 @@ bool CpuArm7tdmi::executeThumbInstruction(u16 instruction, u32 currentPc) {
             regs_[rd] = rsValue;
             if (rd == 15U) {
                 regs_[15] &= ~1U;
-                if (!isValidExecuteAddress(regs_[15])) {
-                    regs_[15] = currentPc + 2U;
-                }
             }
             return true;
         }
@@ -1065,30 +1174,6 @@ bool CpuArm7tdmi::executeThumbInstruction(u16 instruction, u32 currentPc) {
         // BX
         const u32 target = rsValue;
         if (tryReturnFromIrqTrampoline(target)) {
-            return true;
-        }
-        if (!isValidExecuteAddress(target & ~1U)) {
-            const u32 lrTarget = regs_[14];
-            const u32 lrExec = lrTarget & ~1U;
-            const u32 pcExec = currentPc & ~1U;
-            const bool lrLooksSafeReturn = isValidExecuteAddress(lrExec)
-                && (lrExec + 8U < pcExec || lrExec > pcExec + 8U);
-            if (lrLooksSafeReturn) {
-                setThumbMode((lrTarget & 1U) != 0U);
-                regs_[15] = lrTarget;
-                alignPcForCurrentState();
-                return true;
-            }
-            if (std::getenv("GBEMU_GBA_LOG_BAD_PC") != nullptr) {
-                std::cerr << "[GBA][CPU] blocked THUMB BX target=0x" << std::hex << (target & ~1U)
-                          << " pc=0x" << currentPc
-                          << " lr=0x" << regs_[14]
-                          << " sp=0x" << regs_[13]
-                          << " mode=0x" << (cpsr_ & kCpsrModeMask)
-                          << " rs=" << static_cast<unsigned>(rs)
-                          << " rd=" << static_cast<unsigned>(rd)
-                          << std::dec << '\n';
-            }
             return true;
         }
         setThumbMode((target & 1U) != 0U);
@@ -1243,9 +1328,7 @@ bool CpuArm7tdmi::executeThumbInstruction(u16 instruction, u32 currentPc) {
         if (extraReg) {
             const u32 target = memory_->read32(addr);
             addr += 4U;
-            if (isValidExecuteAddress(target & ~1U)) {
-                regs_[15] = target & ~1U;
-            }
+            regs_[15] = target & ~1U;
         }
         regs_[13] = addr;
         return true;
@@ -1285,9 +1368,7 @@ bool CpuArm7tdmi::executeThumbInstruction(u16 instruction, u32 currentPc) {
             const std::int32_t offset = signExtend8(instruction & 0x00FFU) * 2;
             const u32 base = currentPc + 4U;
             const u32 target = static_cast<u32>(static_cast<std::int64_t>(base) + offset);
-            if (isValidExecuteAddress(target)) {
-                regs_[15] = target;
-            }
+            regs_[15] = target;
         }
         return true;
     }
@@ -1297,9 +1378,7 @@ bool CpuArm7tdmi::executeThumbInstruction(u16 instruction, u32 currentPc) {
         const std::int32_t offset = signExtend11(instruction & 0x07FFU) * 2;
         const u32 base = currentPc + 4U;
         const u32 target = static_cast<u32>(static_cast<std::int64_t>(base) + offset);
-        if (isValidExecuteAddress(target)) {
-            regs_[15] = target;
-        }
+        regs_[15] = target;
         return true;
     }
 
@@ -1310,7 +1389,7 @@ bool CpuArm7tdmi::executeThumbInstruction(u16 instruction, u32 currentPc) {
         regs_[14] = prefix;
         thumbBlPrefixPending_ = true;
         thumbBlPrefixValue_ = prefix;
-        if (std::getenv("GBEMU_GBA_LOG_BL") != nullptr) {
+        if (logFlags_.bl) {
             static std::uint64_t blPrefixCount = 0;
             if (blPrefixCount < 128U) {
                 ++blPrefixCount;
@@ -1328,7 +1407,7 @@ bool CpuArm7tdmi::executeThumbInstruction(u16 instruction, u32 currentPc) {
         const u32 target = base + offset;
         thumbBlPrefixPending_ = false;
         regs_[14] = (currentPc + 2U) | 1U;
-        if (std::getenv("GBEMU_GBA_LOG_BL") != nullptr) {
+        if (logFlags_.bl) {
             static std::uint64_t blSuffixCount = 0;
             if (blSuffixCount < 128U) {
                 ++blSuffixCount;
@@ -1348,9 +1427,7 @@ bool CpuArm7tdmi::executeThumbInstruction(u16 instruction, u32 currentPc) {
                           << std::dec << '\n';
             }
         }
-        if (isValidExecuteAddress(target & ~1U)) {
-            regs_[15] = target & ~1U;
-        }
+        regs_[15] = target & ~1U;
         return true;
     }
 
@@ -1362,7 +1439,6 @@ bool CpuArm7tdmi::executePsrTransfer(u32 instruction) {
         return false;
     }
 
-    const u32 sequentialPc = regs_[15];
     const bool immediate = (instruction & (1U << 25U)) != 0U;
     const u32 opHi = (instruction >> 23U) & 0x1FU;
     const u32 opLow = (instruction >> 20U) & 0x3U;
@@ -1376,10 +1452,6 @@ bool CpuArm7tdmi::executePsrTransfer(u32 instruction) {
         regs_[rd] = readSpsrSource ? readSpsr() : cpsr_;
         if (rd == 15U) {
             alignPcForCurrentState();
-            if (!isValidExecuteAddress(regs_[15])) {
-                regs_[15] = sequentialPc;
-                alignPcForCurrentState();
-            }
         }
         return true;
     }
@@ -1446,15 +1518,10 @@ bool CpuArm7tdmi::executeDataProcessing(u32 instruction) {
     const bool setFlags = (instruction & (1U << 20U)) != 0U;
     const u8 rn = static_cast<u8>((instruction >> 16U) & 0x0FU);
     const u8 rd = static_cast<u8>((instruction >> 12U) & 0x0FU);
-    const u32 sequentialPc = regs_[15];
 
     bool shifterCarry = flagC();
     const u32 op2 = readOperand2(instruction, shifterCarry);
-    u32 lhs = regs_[rn];
-    if (rn == 15U) {
-        // Em ARM state, ler R15 em data-processing observa PC atual + 8.
-        lhs += 4U;
-    }
+    const u32 lhs = readArmRegister(rn);
 
     u32 result = 0;
     bool writeResult = true;
@@ -1554,7 +1621,6 @@ bool CpuArm7tdmi::executeDataProcessing(u32 instruction) {
     }
 
     const bool restoreFromSpsr = setFlags && writeResult && rd == 15U;
-    const u32 modeBeforeRestore = cpsr_ & kCpsrModeMask;
     const bool shouldSetFlags = (setFlags || !writeResult) && !restoreFromSpsr;
     if (shouldSetFlags) {
         if (updateFlagsLogical) {
@@ -1572,22 +1638,6 @@ bool CpuArm7tdmi::executeDataProcessing(u32 instruction) {
     }
     if (writeResult && rd == 15U) {
         alignPcForCurrentState();
-        if (!isValidExecuteAddress(regs_[15])) {
-            if (restoreFromSpsr && modeBeforeRestore == kModeIrq) {
-                const u32 resume = irqResumeAddress_;
-                for (std::size_t i = 0; i < irqSavedRegs_.size(); ++i) {
-                    regs_[i] = irqSavedRegs_[i];
-                }
-                if (isValidExecuteAddress(resume & ~1U)) {
-                    regs_[15] = resume;
-                } else {
-                    regs_[15] = sequentialPc;
-                }
-            } else {
-                regs_[15] = sequentialPc;
-            }
-            alignPcForCurrentState();
-        }
     }
 
     return true;
@@ -1598,7 +1648,6 @@ bool CpuArm7tdmi::executeSingleDataTransfer(u32 instruction) {
         return false;
     }
 
-    const u32 sequentialPc = regs_[15];
     const bool immediateOffsetIsRegister = (instruction & (1U << 25U)) != 0U;
 
     const bool preIndex = (instruction & (1U << 24U)) != 0U;
@@ -1612,7 +1661,7 @@ bool CpuArm7tdmi::executeSingleDataTransfer(u32 instruction) {
     u32 offset = instruction & 0x0FFFU;
     if (immediateOffsetIsRegister) {
         const std::size_t rmIndex = static_cast<std::size_t>(instruction & 0x0FU);
-        offset = regs_[rmIndex];
+        offset = readArmRegister(rmIndex);
         const unsigned shiftType = static_cast<unsigned>((instruction >> 5U) & 0x03U);
         const unsigned shiftImm = static_cast<unsigned>((instruction >> 7U) & 0x1FU);
         if ((instruction & (1U << 4U)) != 0U) {
@@ -1650,10 +1699,7 @@ bool CpuArm7tdmi::executeSingleDataTransfer(u32 instruction) {
         }
     }
 
-    u32 base = regs_[rn];
-    if (rn == 15U) {
-        base += 4U; // ajuste de pipeline para enderecamento com PC.
-    }
+    const u32 base = readArmRegister(rn);
     const u32 effective = addOffset ? base + offset : base - offset;
     const u32 address = preIndex ? effective : base;
 
@@ -1665,16 +1711,13 @@ bool CpuArm7tdmi::executeSingleDataTransfer(u32 instruction) {
         }
         if (rd == 15U) {
             alignPcForCurrentState();
-            if (!isValidExecuteAddress(regs_[15])) {
-                regs_[15] = sequentialPc;
-                alignPcForCurrentState();
-            }
         }
     } else {
+        const u32 storeValue = readArmRegister(rd, true);
         if (byteTransfer) {
-            memory_->write8(address, static_cast<u8>(regs_[rd] & 0xFFU));
+            memory_->write8(address, static_cast<u8>(storeValue & 0xFFU));
         } else {
-            memory_->write32(address, regs_[rd]);
+            memory_->write32(address, storeValue);
         }
     }
 
@@ -1689,8 +1732,16 @@ bool CpuArm7tdmi::executeHalfwordDataTransfer(u32 instruction) {
     if ((instruction & 0x0E000090U) != 0x00000090U) {
         return false;
     }
+    if ((instruction & 0x0F8000F0U) == 0x00800090U) {
+        return false; // long multiply
+    }
+    if ((instruction & 0x0FC000F0U) == 0x00000090U) {
+        return false; // mul/mla
+    }
+    if ((instruction & 0x0FB00FF0U) == 0x01000090U) {
+        return false; // swp/swpb
+    }
 
-    const u32 sequentialPc = regs_[15];
     const bool preIndex = (instruction & (1U << 24U)) != 0U;
     const bool addOffset = (instruction & (1U << 23U)) != 0U;
     const bool immediateOffset = (instruction & (1U << 22U)) != 0U;
@@ -1707,13 +1758,10 @@ bool CpuArm7tdmi::executeHalfwordDataTransfer(u32 instruction) {
         offset = (high << 4U) | low;
     } else {
         const u8 rm = static_cast<u8>(instruction & 0x0FU);
-        offset = regs_[rm];
+        offset = readArmRegister(rm);
     }
 
-    u32 base = regs_[rn];
-    if (rn == 15U) {
-        base += 4U; // ajuste de pipeline para enderecamento com PC.
-    }
+    const u32 base = readArmRegister(rn);
     const u32 effective = addOffset ? base + offset : base - offset;
     const u32 address = preIndex ? effective : base;
 
@@ -1733,20 +1781,16 @@ bool CpuArm7tdmi::executeHalfwordDataTransfer(u32 instruction) {
                 );
             }
         } else {
-            return true;
+            return false;
         }
         if (rd == 15U) {
             alignPcForCurrentState();
-            if (!isValidExecuteAddress(regs_[15])) {
-                regs_[15] = sequentialPc;
-                alignPcForCurrentState();
-            }
         }
     } else {
         if (sh != 0x01U) {
-            return true;
+            return false;
         }
-        memory_->write16(address, static_cast<u16>(regs_[rd] & 0xFFFFU));
+        memory_->write16(address, static_cast<u16>(readArmRegister(rd, true) & 0xFFFFU));
     }
 
     if (!preIndex || writeBack) {
@@ -1761,7 +1805,6 @@ bool CpuArm7tdmi::executeBlockDataTransfer(u32 instruction) {
         return false;
     }
 
-    const u32 sequentialPc = regs_[15];
     const bool preIndex = (instruction & (1U << 24U)) != 0U;
     const bool addOffset = (instruction & (1U << 23U)) != 0U;
     const bool psrAndForceUser = (instruction & (1U << 22U)) != 0U;
@@ -1780,10 +1823,10 @@ bool CpuArm7tdmi::executeBlockDataTransfer(u32 instruction) {
         return true;
     }
 
-    u32 base = regs_[rn];
-    if (rn == 15U) {
-        base += 4U; // ajuste de pipeline para base PC em LDM/STM.
-    }
+    const bool restoringFromSpsr = load && psrAndForceUser && (regList & (1U << 15U)) != 0U;
+    const bool useUserBank = psrAndForceUser && !restoringFromSpsr;
+
+    const u32 base = readArmRegister(rn);
 
     // Enderecamento ARM LDM/STM:
     // U=1 -> incrementa; U=0 -> decrementa.
@@ -1800,10 +1843,19 @@ bool CpuArm7tdmi::executeBlockDataTransfer(u32 instruction) {
         if ((regList & static_cast<u16>(1U << r)) == 0U) {
             continue;
         }
+        const auto regIndex = static_cast<std::size_t>(r);
         if (load) {
-            regs_[static_cast<std::size_t>(r)] = memory_->read32(address);
+            const u32 value = memory_->read32(address);
+            if (useUserBank && regIndex != 15U) {
+                writeUserBankRegister(regIndex, value);
+            } else {
+                regs_[regIndex] = value;
+            }
         } else {
-            memory_->write32(address, regs_[static_cast<std::size_t>(r)]);
+            const u32 value = (useUserBank && regIndex != 15U)
+                ? readUserBankRegister(regIndex)
+                : readArmRegister(regIndex, true);
+            memory_->write32(address, value);
         }
         address += 4U;
     }
@@ -1813,37 +1865,94 @@ bool CpuArm7tdmi::executeBlockDataTransfer(u32 instruction) {
         regs_[rn] = addOffset ? (regs_[rn] + blockBytes) : (regs_[rn] - blockBytes);
     }
     if (load && (regList & (1U << 15U)) != 0U) {
-        if (psrAndForceUser) {
+        if (restoringFromSpsr) {
             writeCpsr(readSpsr());
         }
         alignPcForCurrentState();
-        if (!isValidExecuteAddress(regs_[15])) {
-            regs_[15] = sequentialPc;
-            alignPcForCurrentState();
-        }
     }
     return true;
 }
 
 bool CpuArm7tdmi::executeMultiply(u32 instruction) {
-    if ((instruction & 0x0FC000F0U) != 0x00000090U) {
+    if ((instruction & 0x0FC000F0U) == 0x00000090U) {
+        const bool accumulate = (instruction & (1U << 21U)) != 0U;
+        const bool setFlags = (instruction & (1U << 20U)) != 0U;
+        const std::size_t rd = static_cast<std::size_t>((instruction >> 16U) & 0x0FU);
+        const std::size_t rn = static_cast<std::size_t>((instruction >> 12U) & 0x0FU);
+        const std::size_t rs = static_cast<std::size_t>((instruction >> 8U) & 0x0FU);
+        const std::size_t rm = static_cast<std::size_t>(instruction & 0x0FU);
+
+        u32 result = regs_[rm] * regs_[rs];
+        if (accumulate) {
+            result = result + regs_[rn];
+        }
+        regs_[rd] = result;
+        if (setFlags) {
+            updateNz(result);
+        }
+        return true;
+    }
+
+    // Long multiply variants: UMULL/UMLAL/SMULL/SMLAL.
+    if ((instruction & 0x0F8000F0U) == 0x00800090U) {
+        const bool signedMultiply = (instruction & (1U << 22U)) != 0U;
+        const bool accumulate = (instruction & (1U << 21U)) != 0U;
+        const bool setFlags = (instruction & (1U << 20U)) != 0U;
+        const std::size_t rdHi = static_cast<std::size_t>((instruction >> 16U) & 0x0FU);
+        const std::size_t rdLo = static_cast<std::size_t>((instruction >> 12U) & 0x0FU);
+        const std::size_t rs = static_cast<std::size_t>((instruction >> 8U) & 0x0FU);
+        const std::size_t rm = static_cast<std::size_t>(instruction & 0x0FU);
+
+        std::uint64_t result = 0U;
+        if (signedMultiply) {
+            const auto lhs = static_cast<std::int64_t>(static_cast<std::int32_t>(regs_[rm]));
+            const auto rhs = static_cast<std::int64_t>(static_cast<std::int32_t>(regs_[rs]));
+            result = static_cast<std::uint64_t>(lhs * rhs);
+        } else {
+            result = static_cast<std::uint64_t>(regs_[rm]) * static_cast<std::uint64_t>(regs_[rs]);
+        }
+        if (accumulate) {
+            const std::uint64_t acc = (static_cast<std::uint64_t>(regs_[rdHi]) << 32U)
+                | static_cast<std::uint64_t>(regs_[rdLo]);
+            result += acc;
+        }
+
+        regs_[rdLo] = static_cast<u32>(result & 0xFFFFFFFFULL);
+        regs_[rdHi] = static_cast<u32>(result >> 32U);
+        if (setFlags) {
+            setFlag(kCpsrN, (result & (1ULL << 63U)) != 0U);
+            setFlag(kCpsrZ, result == 0U);
+        }
+        return true;
+    }
+
+    return false;
+}
+
+bool CpuArm7tdmi::executeSwap(u32 instruction) {
+    if ((instruction & 0x0FB00FF0U) != 0x01000090U) {
         return false;
     }
 
-    const bool accumulate = (instruction & (1U << 21U)) != 0U;
-    const bool setFlags = (instruction & (1U << 20U)) != 0U;
-    const std::size_t rd = static_cast<std::size_t>((instruction >> 16U) & 0x0FU);
-    const std::size_t rn = static_cast<std::size_t>((instruction >> 12U) & 0x0FU);
-    const std::size_t rs = static_cast<std::size_t>((instruction >> 8U) & 0x0FU);
+    const bool byteTransfer = (instruction & (1U << 22U)) != 0U;
+    const std::size_t rn = static_cast<std::size_t>((instruction >> 16U) & 0x0FU);
+    const std::size_t rd = static_cast<std::size_t>((instruction >> 12U) & 0x0FU);
     const std::size_t rm = static_cast<std::size_t>(instruction & 0x0FU);
+    const u32 address = readArmRegister(rn);
+    const u32 sourceValue = readArmRegister(rm, true);
 
-    u32 result = regs_[rm] * regs_[rs];
-    if (accumulate) {
-        result = result + regs_[rn];
+    if (byteTransfer) {
+        const u8 value = memory_->read8(address);
+        memory_->write8(address, static_cast<u8>(sourceValue & 0xFFU));
+        regs_[rd] = value;
+        return true;
     }
-    regs_[rd] = result;
-    if (setFlags) {
-        updateNz(result);
+
+    const u32 value = memory_->read32(address);
+    memory_->write32(address, sourceValue);
+    regs_[rd] = value;
+    if (rd == 15U) {
+        alignPcForCurrentState();
     }
     return true;
 }
@@ -1853,7 +1962,6 @@ bool CpuArm7tdmi::executeBranch(u32 instruction) {
         return false;
     }
 
-    const u32 sequentialPc = regs_[15];
     const bool link = (instruction & (1U << 24U)) != 0U;
     u32 imm24 = instruction & 0x00FFFFFFU;
     if ((imm24 & 0x00800000U) != 0U) {
@@ -1864,18 +1972,11 @@ bool CpuArm7tdmi::executeBranch(u32 instruction) {
     const u32 nextPc = regs_[15];
     const u32 branchBase = nextPc + 4U; // PC visto pelo branch = current + 8.
     const u32 target = branchBase + offset;
-    if (!isValidExecuteAddress(target)) {
-        return true;
-    }
     if (link) {
         regs_[14] = nextPc;
     }
     regs_[15] = target;
     alignPcForCurrentState();
-    if (!isValidExecuteAddress(regs_[15])) {
-        regs_[15] = sequentialPc;
-        alignPcForCurrentState();
-    }
     return true;
 }
 
@@ -1885,35 +1986,8 @@ bool CpuArm7tdmi::executeBranchExchange(u32 instruction) {
     }
 
     const u8 rn = static_cast<u8>(instruction & 0x0FU);
-    const u32 target = regs_[rn];
+    const u32 target = readArmRegister(rn);
     if (tryReturnFromIrqTrampoline(target)) {
-        return true;
-    }
-    const u32 mode = cpsr_ & kCpsrModeMask;
-    if (!isValidExecuteAddress(target & ~1U)) {
-        const u32 currentPc = regs_[15] - 4U;
-        const u32 lrTarget = regs_[14];
-        const u32 lrExec = lrTarget & ~1U;
-        const u32 pcExec = currentPc & ~1U;
-        const bool lrLooksSafeReturn = isValidExecuteAddress(lrExec)
-            && (lrExec + 8U < pcExec || lrExec > pcExec + 8U);
-        if (lrLooksSafeReturn) {
-            setThumbMode((lrTarget & 1U) != 0U);
-            regs_[15] = lrTarget;
-            alignPcForCurrentState();
-            return true;
-        }
-        if (std::getenv("GBEMU_GBA_LOG_BAD_PC") != nullptr) {
-            const u32 opcode = memory_ != nullptr ? memory_->read32(currentPc) : 0U;
-            std::cerr << "[GBA][CPU] blocked BX target=0x" << std::hex << (target & ~1U)
-                      << " pc=0x" << currentPc
-                      << " op=0x" << opcode
-                      << " r0=0x" << regs_[0]
-                      << " lr=0x" << regs_[14]
-                      << " mode=0x" << mode
-                      << " rn=" << static_cast<unsigned>(rn)
-                      << std::dec << '\n';
-        }
         return true;
     }
     setThumbMode((target & 1U) != 0U);
@@ -1957,33 +2031,39 @@ bool CpuArm7tdmi::handlePendingInterrupt() {
     const u16 irq = static_cast<u16>(pending & static_cast<u16>(0U - pending));
     (void)irq;
 
-    const u32 oldCpsr = cpsr_;
-    for (std::size_t i = 0; i < irqSavedRegs_.size(); ++i) {
-        irqSavedRegs_[i] = regs_[i];
+    if (irqContextDepth_ >= irqContextStack_.size()) {
+        return false;
     }
-    irqSavedCpsr_ = oldCpsr;
-    irqResumeAddress_ = regs_[15] | (thumbMode() ? 1U : 0U);
-    irqDispatchActive_ = true;
-    if (!isValidExecuteAddress(irqResumeAddress_ & ~1U)) {
-        irqDispatchActive_ = false;
+
+    IrqContext context{};
+    const u32 oldCpsr = cpsr_;
+    for (std::size_t i = 0; i < context.regs.size(); ++i) {
+        context.regs[i] = regs_[i];
+    }
+    context.cpsr = oldCpsr;
+    context.resumeAddress = regs_[15] | (thumbMode() ? 1U : 0U);
+    context.entrySp = 0U;
+    if (!isValidExecuteAddress(context.resumeAddress & ~1U)) {
         return false;
     }
     const u32 handler = memory_->read32(0x03007FFCU);
     const u32 target = handler != 0U ? handler : 0x00000018U;
     if (!isValidExecuteAddress(target & ~1U)) {
-        irqDispatchActive_ = false;
         return false;
     }
+    irqContextStack_[irqContextDepth_] = context;
+    ++irqContextDepth_;
+
     const u32 irqReturnMarker = kIrqReturnTrampoline | 1U;
-    // BIOS IRQ wrapper normalmente empilha um retorno; alguns handlers esperam isso.
-    regs_[13] -= 4U;
-    memory_->write32(regs_[13], irqReturnMarker);
     switchMode(kModeIrq);
     writeSpsr(oldCpsr);
-    // Alguns handlers operam diretamente na stack IRQ.
+    irqContextStack_[irqContextDepth_ - 1U].entrySp = regs_[13];
+    // Marca de retorno para handlers THUMB que fazem POP {r0}; BX r0.
     regs_[13] -= 4U;
     memory_->write32(regs_[13], irqReturnMarker);
     regs_[14] = irqReturnMarker;
+    // BIOS IRQ ABI: r0 aponta para IO base (0x04000000) quando chama handler.
+    regs_[0] = 0x04000000U;
     setFlag(kCpsrI, true);
     setThumbMode((target & 1U) != 0U);
     regs_[15] = target & ~1U;
@@ -1996,21 +2076,28 @@ bool CpuArm7tdmi::tryReturnFromIrqTrampoline(u32 target) {
     if ((target & ~1U) != kIrqReturnTrampoline) {
         return false;
     }
-    if (irqResumeAddress_ == 0U) {
+    if (irqContextDepth_ == 0U) {
         return false;
     }
-    irqDispatchActive_ = false;
-    writeCpsr(irqSavedCpsr_);
-    for (std::size_t i = 0; i < irqSavedRegs_.size(); ++i) {
-        regs_[i] = irqSavedRegs_[i];
+    const IrqContext context = irqContextStack_[irqContextDepth_ - 1U];
+    if (context.resumeAddress == 0U) {
+        return false;
     }
-    if (isValidExecuteAddress(irqResumeAddress_ & ~1U)) {
-        regs_[15] = irqResumeAddress_;
+    --irqContextDepth_;
+    writeCpsr(context.cpsr);
+    if (context.entrySp != 0U) {
+        irqBank_.sp = context.entrySp;
+    }
+    irqBank_.lr = 0U;
+    for (std::size_t i = 0; i < context.regs.size(); ++i) {
+        regs_[i] = context.regs[i];
+    }
+    if (isValidExecuteAddress(context.resumeAddress & ~1U)) {
+        regs_[15] = context.resumeAddress;
     } else {
         regs_[15] = ResetPc;
         setThumbMode(false);
     }
-    irqResumeAddress_ = 0U;
     alignPcForCurrentState();
     return true;
 }
@@ -2019,7 +2106,7 @@ void CpuArm7tdmi::handleSwi(u32 swiNumber) {
     const u32 id = swiNumber & 0xFFU;
     static std::array<std::uint64_t, 256> swiCounts{};
     ++swiCounts[id];
-    const bool logSwi = std::getenv("GBEMU_GBA_LOG_SWI") != nullptr;
+    const bool logSwi = logFlags_.swi;
     if (logSwi && swiCounts[id] <= 8U) {
         std::cerr << "[GBA][SWI] id=0x" << std::hex << id << " count=" << std::dec << swiCounts[id]
                   << " pc=0x" << std::hex << regs_[15]
@@ -2046,10 +2133,15 @@ void CpuArm7tdmi::handleSwi(u32 swiNumber) {
             abtBank_ = BankedRegisters{};
             undBank_ = BankedRegisters{};
             fiqBank_ = BankedRegisters{};
+            sharedR8ToR12_.fill(0);
+            fiqR8ToR12_.fill(0);
             userBank_.sp = 0x03007F00U;
             irqBank_.sp = 0x03007FA0U;
             svcBank_.sp = 0x03007FE0U;
-            irqResumeAddress_ = 0;
+            for (auto& context : irqContextStack_) {
+                context = IrqContext{};
+            }
+            irqContextDepth_ = 0;
             writeCpsr(kModeSupervisor | kCpsrI);
             regs_[15] = (bootFlag & 1U) != 0U ? 0x02000000U : ResetPc;
             alignPcForCurrentState();

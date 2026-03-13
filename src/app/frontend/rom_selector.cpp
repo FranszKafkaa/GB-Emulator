@@ -10,10 +10,7 @@
 #include "gb/app/frontend/rom_selector.hpp"
 
 #ifdef GBEMU_USE_SDL2
-#include <SDL2/SDL.h>
-#ifdef GBEMU_USE_SDL2_IMAGE
-#include <SDL2/SDL_image.h>
-#endif
+#include "gb/app/sdl_compat.hpp"
 #endif
 
 namespace gb::frontend {

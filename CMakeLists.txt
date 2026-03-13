@@ -43,31 +43,40 @@ add_executable(gbemu
     src/app/rom_suite_runner.cpp
     src/app/runtime_paths.cpp
     src/app/sdl_frontend.cpp
-    src/app/frontend/debug_ui.cpp
-    src/app/frontend/realtime_support.cpp
-    src/app/frontend/realtime/frame_timeline.cpp
-    src/app/frontend/realtime/audio_ring_buffer.cpp
-    src/app/frontend/realtime/save_slots.cpp
-    src/app/frontend/realtime/cheat_engine.cpp
-    src/app/frontend/realtime/replay_io.cpp
-    src/app/frontend/realtime/control_bindings.cpp
-    src/app/frontend/realtime/link_transport.cpp
-    src/app/frontend/realtime/network_config.cpp
-    src/app/frontend/realtime/top_menu.cpp
-    src/app/frontend/gba_realtime.cpp
-    src/app/frontend/realtime.cpp
-    src/app/frontend/rom_selector.cpp
 )
 target_link_libraries(gbemu PRIVATE gbcore)
 
 if (GBEMU_USE_SDL2)
-    find_package(SDL2 REQUIRED)
-    target_link_libraries(gbemu PRIVATE SDL2::SDL2)
-    target_compile_definitions(gbemu PRIVATE GBEMU_USE_SDL2=1)
-    find_package(SDL2_image QUIET)
-    if (SDL2_image_FOUND)
-        target_link_libraries(gbemu PRIVATE SDL2_image::SDL2_image)
-        target_compile_definitions(gbemu PRIVATE GBEMU_USE_SDL2_IMAGE=1)
+    find_package(SDL2 QUIET)
+    if (SDL2_FOUND)
+        target_sources(gbemu PRIVATE
+            src/app/frontend/debug_ui.cpp
+            src/app/frontend/realtime_support.cpp
+            src/app/frontend/realtime/frame_timeline.cpp
+            src/app/frontend/realtime/audio_ring_buffer.cpp
+            src/app/frontend/realtime/save_slots.cpp
+            src/app/frontend/realtime/cheat_engine.cpp
+            src/app/frontend/realtime/replay_io.cpp
+            src/app/frontend/realtime/control_bindings.cpp
+            src/app/frontend/realtime/link_transport.cpp
+            src/app/frontend/realtime/network_config.cpp
+            src/app/frontend/realtime/top_menu.cpp
+            src/app/frontend/gba_realtime.cpp
+            src/app/frontend/realtime.cpp
+            src/app/frontend/rom_selector.cpp
+        )
+        target_link_libraries(gbemu PRIVATE SDL2::SDL2)
+        if (TARGET SDL2::SDL2main)
+            target_link_libraries(gbemu PRIVATE SDL2::SDL2main)
+        endif()
+        target_compile_definitions(gbemu PRIVATE GBEMU_USE_SDL2=1 SDL_MAIN_HANDLED=1)
+        find_package(SDL2_image QUIET)
+        if (SDL2_image_FOUND)
+            target_link_libraries(gbemu PRIVATE SDL2_image::SDL2_image)
+            target_compile_definitions(gbemu PRIVATE GBEMU_USE_SDL2_IMAGE=1)
+        endif()
+    else()
+        message(WARNING "SDL2 not found. Building without realtime frontend (headless only).")
     endif()
 endif()
 

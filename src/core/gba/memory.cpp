@@ -1,6 +1,10 @@
 #include "gb/core/gba/memory.hpp"
 
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <string>
 
 namespace gb::gba {
 
@@ -15,6 +19,15 @@ constexpr std::array<u16, 4> kTimerIrqMasks = {
 constexpr u16 kKeypadIrqMask = static_cast<u16>(1U << 12U);
 constexpr u32 kVramMirrorStart = 0x18000U;
 constexpr u32 kVramMirrorSubtract = 0x8000U;
+constexpr u32 kBackupSramFlashBase = 0x0E000000U;
+constexpr u32 kBackupSramFlashMask = 0x0000FFFFU;
+constexpr u32 kFlashUnlockAddr1 = 0x5555U;
+constexpr u32 kFlashUnlockAddr2 = 0x2AAAU;
+constexpr std::size_t kSramSize = 0x8000U;
+constexpr std::size_t kFlash64Size = 0x10000U;
+constexpr std::size_t kFlash128Size = 0x20000U;
+constexpr std::size_t kEepromMaxSize = 0x2000U; // 8 KiB
+constexpr std::size_t kEepromWordBytes = 8U;
 
 u32 rotateRight32(u32 value, unsigned amount) {
     const unsigned shift = amount & 31U;
@@ -49,6 +62,54 @@ constexpr bool isDmaControlOffset(u32 offset) {
     return (offset >= 0x0BAU) && (offset <= 0x0E0U) && (((offset - 0x0B0U) % 12U) == 10U);
 }
 
+bool containsAsciiTag(const std::vector<u8>& data, const char* tag) {
+    if (data.empty() || tag == nullptr || *tag == '\0') {
+        return false;
+    }
+    const std::string needle(tag);
+    if (needle.empty() || needle.size() > data.size()) {
+        return false;
+    }
+    return std::search(
+        data.begin(),
+        data.end(),
+        needle.begin(),
+        needle.end()
+    ) != data.end();
+}
+
+std::size_t backupStorageSize(gb::gba::Memory::BackupType type) {
+    switch (type) {
+    case gb::gba::Memory::BackupType::Sram:
+        return kSramSize;
+    case gb::gba::Memory::BackupType::Flash64:
+        return kFlash64Size;
+    case gb::gba::Memory::BackupType::Flash128:
+        return kFlash128Size;
+    case gb::gba::Memory::BackupType::Eeprom:
+        return kEepromMaxSize;
+    case gb::gba::Memory::BackupType::None:
+    default:
+        return 0U;
+    }
+}
+
+std::string backupTypeToText(gb::gba::Memory::BackupType type) {
+    switch (type) {
+    case gb::gba::Memory::BackupType::Sram:
+        return "SRAM";
+    case gb::gba::Memory::BackupType::Flash64:
+        return "FLASH64";
+    case gb::gba::Memory::BackupType::Flash128:
+        return "FLASH128";
+    case gb::gba::Memory::BackupType::Eeprom:
+        return "EEPROM";
+    case gb::gba::Memory::BackupType::None:
+    default:
+        return "NONE";
+    }
+}
+
 } // namespace
 
 bool Memory::loadRom(const std::vector<u8>& romData) {
@@ -56,6 +117,13 @@ bool Memory::loadRom(const std::vector<u8>& romData) {
         return false;
     }
     rom_ = romData;
+    detectBackupType();
+    const u8 backupInit = (backupType_ == BackupType::Flash64 || backupType_ == BackupType::Flash128)
+        ? static_cast<u8>(0x00U)
+        : static_cast<u8>(0xFFU);
+    backupStorage_.assign(backupStorageSize(backupType_), backupInit);
+    backupDirty_ = false;
+    resetBackupState();
     reset();
     return true;
 }
@@ -77,6 +145,7 @@ void Memory::reset() {
     writeIo16(IeOffset, 0);
     writeIo16(IfOffset, 0);
     writeIo16(ImeOffset, 0);
+    resetBackupState();
 }
 
 void Memory::step(int cpuCycles) {
@@ -92,6 +161,12 @@ u8 Memory::read8(u32 address) const {
     }
 
     const u32 region = address >> 24U;
+    if (region == 0x0DU && isEepromBackup()) {
+        return readEepromBit();
+    }
+    if (region == 0x0EU && hasPersistentBackup()) {
+        return readBackup8(address);
+    }
     if (region >= 0x08U && region <= 0x0DU) {
         return readRom8(address);
     }
@@ -99,6 +174,13 @@ u8 Memory::read8(u32 address) const {
 }
 
 u16 Memory::read16(u32 address) const {
+    if ((address >> 24U) == 0x0DU && isEepromBackup()) {
+        return static_cast<u16>(readEepromBit() & 0x1U);
+    }
+    if ((address >> 24U) == 0x0EU && hasPersistentBackup()) {
+        const u8 v = readBackup8(address);
+        return static_cast<u16>(v | static_cast<u16>(v << 8U));
+    }
     const u32 aligned = address & ~1U;
     const u16 lo = static_cast<u16>(read8(aligned));
     const u16 hi = static_cast<u16>(read8(aligned + 1U));
@@ -106,6 +188,15 @@ u16 Memory::read16(u32 address) const {
 }
 
 u32 Memory::read32(u32 address) const {
+    if ((address >> 24U) == 0x0DU && isEepromBackup()) {
+        const u32 bit0 = static_cast<u32>(readEepromBit() & 0x1U);
+        const u32 bit1 = static_cast<u32>(readEepromBit() & 0x1U);
+        return bit0 | (bit1 << 16U);
+    }
+    if ((address >> 24U) == 0x0EU && hasPersistentBackup()) {
+        const u32 v = static_cast<u32>(readBackup8(address));
+        return v | (v << 8U) | (v << 16U) | (v << 24U);
+    }
     const u32 aligned = address & ~3U;
     const u32 b0 = static_cast<u32>(read8(aligned));
     const u32 b1 = static_cast<u32>(read8(aligned + 1U));
@@ -118,6 +209,14 @@ u32 Memory::read32(u32 address) const {
 
 void Memory::write8(u32 address, u8 value) {
     const u32 region = address >> 24U;
+    if (region == 0x0DU && isEepromBackup()) {
+        handleEepromWriteBit(static_cast<u8>(value & 0x1U));
+        return;
+    }
+    if (region == 0x0EU && hasPersistentBackup()) {
+        writeBackup8(address, value);
+        return;
+    }
     if (region == 0x07U) {
         // OAM nao suporta byte-write (ignorado no hardware).
         return;
@@ -139,6 +238,15 @@ void Memory::write8(u32 address, u8 value) {
 }
 
 void Memory::write16(u32 address, u16 value) {
+    if ((address >> 24U) == 0x0DU && isEepromBackup()) {
+        handleEepromWriteBit(static_cast<u8>(value & 0x1U));
+        return;
+    }
+    if ((address >> 24U) == 0x0EU && hasPersistentBackup()) {
+        // Backup bus (SRAM/FLASH) e 8-bit: halfword write afeta somente byte baixo.
+        writeBackup8(address, static_cast<u8>(value & 0xFFU));
+        return;
+    }
     if ((address >> 24U) == 0x04U) {
         writeIo16((address & 0x3FFU) & ~1U, value);
         return;
@@ -153,6 +261,15 @@ void Memory::write16(u32 address, u16 value) {
 }
 
 void Memory::write32(u32 address, u32 value) {
+    if ((address >> 24U) == 0x0DU && isEepromBackup()) {
+        handleEepromWriteBit(static_cast<u8>(value & 0x1U));
+        return;
+    }
+    if ((address >> 24U) == 0x0EU && hasPersistentBackup()) {
+        // Backup bus (SRAM/FLASH) e 8-bit: word write afeta somente byte baixo.
+        writeBackup8(address, static_cast<u8>(value & 0xFFU));
+        return;
+    }
     if ((address >> 24U) == 0x04U) {
         const u32 offset = (address & 0x3FFU) & ~3U;
         writeIo16(offset, static_cast<u16>(value & 0xFFFFU));
@@ -309,6 +426,99 @@ void Memory::triggerDmaStart(u16 startTiming) {
     }
 }
 
+bool Memory::hasPersistentBackup() const {
+    return backupType_ != BackupType::None;
+}
+
+const std::string& Memory::backupTypeName() const {
+    return backupTypeName_;
+}
+
+void Memory::configureBackupBehavior(int forcedEepromAddressBits, bool strictBackupFileSize) {
+    if (forcedEepromAddressBits == 6 || forcedEepromAddressBits == 14) {
+        forcedEepromAddressBits_ = forcedEepromAddressBits;
+    } else {
+        forcedEepromAddressBits_ = 0;
+    }
+    strictBackupFileSize_ = strictBackupFileSize;
+    resetBackupState();
+}
+
+void Memory::setFlashCompatibilityMode(bool enabled) {
+    flashCompatibilityMode_ = enabled;
+    if (!flashCompatibilityMode_ || !isFlashBackup() || backupStorage_.empty()) {
+        return;
+    }
+    const bool looksPristine = std::all_of(backupStorage_.begin(), backupStorage_.end(), [](u8 v) {
+        return v == 0xFFU;
+    });
+    if (looksPristine) {
+        std::fill(backupStorage_.begin(), backupStorage_.end(), static_cast<u8>(0x00U));
+    }
+}
+
+bool Memory::flashCompatibilityMode() const {
+    return flashCompatibilityMode_;
+}
+
+bool Memory::loadBackupFromFile(const std::string& path) {
+    if (backupStorage_.empty() || path.empty()) {
+        return false;
+    }
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return false;
+    }
+    std::vector<u8> fileData{
+        std::istreambuf_iterator<char>(in),
+        std::istreambuf_iterator<char>()
+    };
+    if (fileData.empty()) {
+        return false;
+    }
+    if (backupType_ == BackupType::Eeprom && forcedEepromAddressBits_ == 0) {
+        if (fileData.size() >= kEepromMaxSize) {
+            eepromAddressBits_ = 14;
+        } else if (fileData.size() >= 512U) {
+            eepromAddressBits_ = 6;
+        }
+    }
+    if (strictBackupFileSize_ && fileData.size() != backupPersistSizeBytes()) {
+        if (backupType_ != BackupType::Eeprom) {
+            return false;
+        }
+    }
+    const std::size_t copySize = std::min(fileData.size(), backupStorage_.size());
+    std::copy(fileData.begin(), fileData.begin() + static_cast<std::ptrdiff_t>(copySize), backupStorage_.begin());
+    backupDirty_ = false;
+    resetBackupState();
+    return true;
+}
+
+bool Memory::saveBackupToFile(const std::string& path) const {
+    if (backupStorage_.empty() || path.empty()) {
+        return false;
+    }
+    const std::filesystem::path filePath(path);
+    std::error_code ec;
+    if (filePath.has_parent_path()) {
+        std::filesystem::create_directories(filePath.parent_path(), ec);
+    }
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        return false;
+    }
+    const std::size_t persistSize = backupPersistSizeBytes();
+    if (persistSize == 0U || persistSize > backupStorage_.size()) {
+        return false;
+    }
+    out.write(
+        reinterpret_cast<const char*>(backupStorage_.data()),
+        static_cast<std::streamsize>(persistSize)
+    );
+    return static_cast<bool>(out);
+}
+
 std::uint32_t Memory::timerPrescaler(u16 control) {
     switch (control & 0x3U) {
     case 0U:
@@ -454,6 +664,12 @@ void Memory::executeDmaTransfer(std::size_t channel, u16 triggeredStartTiming) {
     const u16 dstCtrl = static_cast<u16>((control >> 5U) & 0x3U);
     const u16 srcCtrl = static_cast<u16>((control >> 7U) & 0x3U);
     const u32 stride = transfer32 ? 4U : 2U;
+    const bool eepromWriteTransfer = isEepromBackup()
+        && !transfer32
+        && ((destInit >> 24U) == 0x0DU);
+    if (eepromWriteTransfer) {
+        eepromExpectedWriteBits_ = static_cast<int>(units);
+    }
 
     for (u32 i = 0; i < units; ++i) {
         if (transfer32) {
@@ -507,6 +723,9 @@ void Memory::executeDmaTransfer(std::size_t channel, u16 triggeredStartTiming) {
     if (irqOnEnd) {
         requestInterrupt(static_cast<u16>(1U << (8U + static_cast<u16>(channel))));
     }
+    if (eepromWriteTransfer) {
+        eepromExpectedWriteBits_ = 0;
+    }
 }
 
 void Memory::updateKeypadInterrupt() {
@@ -538,6 +757,477 @@ u8 Memory::readRom8(u32 address) const {
     const u32 romAddress = address - 0x08000000U;
     const std::size_t idx = static_cast<std::size_t>(romAddress & 0x01FFFFFFU) % rom_.size();
     return rom_[idx];
+}
+
+void Memory::detectBackupType() {
+    backupType_ = BackupType::None;
+    if (containsAsciiTag(rom_, "EEPROM_V")) {
+        backupType_ = BackupType::Eeprom;
+        return;
+    }
+    if (containsAsciiTag(rom_, "FLASH1M_V")) {
+        backupType_ = BackupType::Flash128;
+        return;
+    }
+    if (containsAsciiTag(rom_, "FLASH512_V")) {
+        backupType_ = BackupType::Flash64;
+        return;
+    }
+    if (containsAsciiTag(rom_, "FLASH_V")) {
+        backupType_ = BackupType::Flash64;
+        return;
+    }
+    if (containsAsciiTag(rom_, "SRAM_V") || containsAsciiTag(rom_, "SRAM_F_V")) {
+        backupType_ = BackupType::Sram;
+        return;
+    }
+}
+
+std::size_t Memory::effectiveEepromAddressBits() const {
+    if (forcedEepromAddressBits_ == 6 || forcedEepromAddressBits_ == 14) {
+        return static_cast<std::size_t>(forcedEepromAddressBits_);
+    }
+    // Heuristica comum: ROM > 16 MiB tende a usar EEPROM 8 KiB (14-bit).
+    return rom_.size() > 0x01000000U ? 14U : 6U;
+}
+
+std::size_t Memory::backupPersistSizeBytes() const {
+    switch (backupType_) {
+    case BackupType::Sram:
+        return kSramSize;
+    case BackupType::Flash64:
+        return kFlash64Size;
+    case BackupType::Flash128:
+        return kFlash128Size;
+    case BackupType::Eeprom:
+        return effectiveEepromAddressBits() <= 6U ? 512U : kEepromMaxSize;
+    case BackupType::None:
+    default:
+        return 0U;
+    }
+}
+
+void Memory::resetBackupState() {
+    backupTypeName_ = backupTypeToText(backupType_);
+    if (backupType_ == BackupType::Eeprom) {
+        eepromAddressBits_ = static_cast<int>(effectiveEepromAddressBits());
+    } else {
+        eepromAddressBits_ = 0;
+    }
+    eepromWriteBits_.clear();
+    eepromReadBits_.clear();
+    eepromReadCursor_ = 0;
+    eepromExpectedWriteBits_ = 0;
+    flashStage_ = FlashStage::Ready;
+    flashIdMode_ = false;
+    flashBank_ = 0;
+}
+
+u8 Memory::readBackup8(u32 address) const {
+    if (backupStorage_.empty()) {
+        return 0xFFU;
+    }
+
+    if (isFlashBackup()) {
+        if (flashCompatibilityMode_) {
+            const std::size_t idx = static_cast<std::size_t>(address & kBackupSramFlashMask) % backupStorage_.size();
+            return backupStorage_[idx];
+        }
+        return readFlash8(address);
+    }
+
+    if (backupType_ == BackupType::Sram) {
+        const std::size_t idx = static_cast<std::size_t>(address & kBackupSramFlashMask) % backupStorage_.size();
+        return backupStorage_[idx];
+    }
+
+    return 0xFFU;
+}
+
+void Memory::writeBackup8(u32 address, u8 value) {
+    if (backupStorage_.empty()) {
+        return;
+    }
+
+    if (isFlashBackup()) {
+        if (flashCompatibilityMode_) {
+            const std::size_t idx = static_cast<std::size_t>(address & kBackupSramFlashMask) % backupStorage_.size();
+            if (backupStorage_[idx] != value) {
+                backupStorage_[idx] = value;
+                backupDirty_ = true;
+            }
+            return;
+        }
+        handleFlashCommandWrite(address, value);
+        return;
+    }
+
+    if (backupType_ == BackupType::Sram) {
+        const std::size_t idx = static_cast<std::size_t>(address & kBackupSramFlashMask) % backupStorage_.size();
+        if (backupStorage_[idx] != value) {
+            backupStorage_[idx] = value;
+            backupDirty_ = true;
+        }
+    }
+}
+
+bool Memory::isEepromBackup() const {
+    return backupType_ == BackupType::Eeprom;
+}
+
+bool Memory::isFlashBackup() const {
+    return backupType_ == BackupType::Flash64 || backupType_ == BackupType::Flash128;
+}
+
+u8 Memory::readEepromBit() const {
+    if (!isEepromBackup()) {
+        return 1U;
+    }
+    if (eepromReadCursor_ < eepromReadBits_.size()) {
+        const u8 bit = static_cast<u8>(eepromReadBits_[eepromReadCursor_] & 0x1U);
+        ++eepromReadCursor_;
+        if (eepromReadCursor_ >= eepromReadBits_.size()) {
+            eepromReadBits_.clear();
+            eepromReadCursor_ = 0;
+        }
+        return bit;
+    }
+    // Linha serial ociosa permanece em alto.
+    return 1U;
+}
+
+void Memory::pushEepromReadBlock(u32 addressWord) {
+    if (!isEepromBackup() || backupStorage_.empty()) {
+        return;
+    }
+    const std::size_t blockCount = eepromAddressBits_ <= 6 ? 64U : 1024U;
+    const std::size_t safeBlockCount = std::min(blockCount, backupStorage_.size() / kEepromWordBytes);
+    if (safeBlockCount == 0U) {
+        return;
+    }
+    const std::size_t block = static_cast<std::size_t>(addressWord) & (safeBlockCount - 1U);
+    const std::size_t base = block * kEepromWordBytes;
+
+    eepromReadBits_.clear();
+    eepromReadCursor_ = 0;
+    // Datasheet: 4 bits dummy e depois 64 bits de dados.
+    eepromReadBits_.insert(eepromReadBits_.end(), 4U, 0U);
+    for (std::size_t i = 0; i < kEepromWordBytes; ++i) {
+        const u8 byte = backupStorage_[base + i];
+        for (int bit = 7; bit >= 0; --bit) {
+            eepromReadBits_.push_back(static_cast<u8>((byte >> bit) & 0x1U));
+        }
+    }
+}
+
+void Memory::handleEepromWriteBit(u8 bit) {
+    if (!isEepromBackup()) {
+        return;
+    }
+    eepromWriteBits_.push_back(static_cast<u8>(bit & 0x1U));
+    maybeCommitEepromCommand();
+}
+
+void Memory::maybeCommitEepromCommand() {
+    if (eepromExpectedWriteBits_ > 0) {
+        const std::size_t expected = static_cast<std::size_t>(eepromExpectedWriteBits_);
+        if (eepromWriteBits_.size() < expected) {
+            return;
+        }
+        if (eepromWriteBits_.size() > expected) {
+            eepromWriteBits_.clear();
+            return;
+        }
+
+        auto decodeRead = [&](int addressBits) {
+            if (expected != static_cast<std::size_t>(addressBits == 6 ? 9 : 17)) {
+                return false;
+            }
+            if (eepromWriteBits_[0] != 1U || eepromWriteBits_[1] != 1U) {
+                return false;
+            }
+            u32 addressWord = 0U;
+            for (int i = 0; i < addressBits; ++i) {
+                addressWord = (addressWord << 1U) | static_cast<u32>(eepromWriteBits_[2U + static_cast<std::size_t>(i)] & 0x1U);
+            }
+            eepromAddressBits_ = addressBits;
+            pushEepromReadBlock(addressWord);
+            eepromWriteBits_.clear();
+            return true;
+        };
+
+        auto decodeWrite = [&](int addressBits) {
+            if (expected != static_cast<std::size_t>(addressBits == 6 ? 73 : 81) || backupStorage_.empty()) {
+                return false;
+            }
+            if (eepromWriteBits_[0] != 1U || eepromWriteBits_[1] != 0U) {
+                return false;
+            }
+            u32 addressWord = 0U;
+            for (int i = 0; i < addressBits; ++i) {
+                addressWord = (addressWord << 1U) | static_cast<u32>(eepromWriteBits_[2U + static_cast<std::size_t>(i)] & 0x1U);
+            }
+            const std::size_t blockCount = addressBits <= 6 ? 64U : 1024U;
+            const std::size_t safeBlockCount = std::min(blockCount, backupStorage_.size() / kEepromWordBytes);
+            const std::size_t block = safeBlockCount == 0U ? 0U : (static_cast<std::size_t>(addressWord) & (safeBlockCount - 1U));
+            const std::size_t base = block * kEepromWordBytes;
+            for (std::size_t byteIndex = 0; byteIndex < kEepromWordBytes; ++byteIndex) {
+                u8 out = 0U;
+                for (int bitIndex = 0; bitIndex < 8; ++bitIndex) {
+                    const std::size_t src = 2U + static_cast<std::size_t>(addressBits) + byteIndex * 8U + static_cast<std::size_t>(bitIndex);
+                    out = static_cast<u8>((out << 1U) | (eepromWriteBits_[src] & 0x1U));
+                }
+                if (base + byteIndex < backupStorage_.size() && backupStorage_[base + byteIndex] != out) {
+                    backupStorage_[base + byteIndex] = out;
+                    backupDirty_ = true;
+                }
+            }
+            eepromAddressBits_ = addressBits;
+            eepromWriteBits_.clear();
+            return true;
+        };
+
+        if (decodeRead(14) || decodeRead(6) || decodeWrite(14) || decodeWrite(6)) {
+            return;
+        }
+        eepromWriteBits_.clear();
+        return;
+    }
+
+    if (eepromWriteBits_.size() < 2U) {
+        return;
+    }
+
+    const u8 op = static_cast<u8>((eepromWriteBits_[0] << 1U) | eepromWriteBits_[1]);
+    if (op != 0x2U && op != 0x3U) {
+        eepromWriteBits_.clear();
+        return;
+    }
+
+    const auto commitRead = [&](int addressBits, std::size_t totalBits) {
+        if (eepromWriteBits_.size() != totalBits) {
+            return false;
+        }
+        u32 addressWord = 0U;
+        for (int i = 0; i < addressBits; ++i) {
+            addressWord = (addressWord << 1U) | static_cast<u32>(eepromWriteBits_[2U + static_cast<std::size_t>(i)] & 0x1U);
+        }
+        eepromAddressBits_ = addressBits;
+        pushEepromReadBlock(addressWord);
+        eepromWriteBits_.clear();
+        return true;
+    };
+
+    const auto commitWrite = [&](int addressBits, std::size_t totalBits) {
+        if (eepromWriteBits_.size() != totalBits || backupStorage_.empty()) {
+            return false;
+        }
+        u32 addressWord = 0U;
+        for (int i = 0; i < addressBits; ++i) {
+            addressWord = (addressWord << 1U) | static_cast<u32>(eepromWriteBits_[2U + static_cast<std::size_t>(i)] & 0x1U);
+        }
+
+        const std::size_t blockCount = addressBits <= 6 ? 64U : 1024U;
+        const std::size_t safeBlockCount = std::min(blockCount, backupStorage_.size() / kEepromWordBytes);
+        const std::size_t block = safeBlockCount == 0U ? 0U : (static_cast<std::size_t>(addressWord) & (safeBlockCount - 1U));
+        const std::size_t base = block * kEepromWordBytes;
+        for (std::size_t byteIndex = 0; byteIndex < kEepromWordBytes; ++byteIndex) {
+            u8 out = 0U;
+            for (int bitIndex = 0; bitIndex < 8; ++bitIndex) {
+                const std::size_t src = 2U + static_cast<std::size_t>(addressBits) + byteIndex * 8U + static_cast<std::size_t>(bitIndex);
+                out = static_cast<u8>((out << 1U) | (eepromWriteBits_[src] & 0x1U));
+            }
+            if (base + byteIndex < backupStorage_.size() && backupStorage_[base + byteIndex] != out) {
+                backupStorage_[base + byteIndex] = out;
+                backupDirty_ = true;
+            }
+        }
+
+        eepromAddressBits_ = addressBits;
+        eepromWriteBits_.clear();
+        return true;
+    };
+
+    if (op == 0x3U) { // READ
+        if (eepromAddressBits_ == 6) {
+            if (commitRead(6, 9U)) {
+                return;
+            }
+            if (commitRead(14, 17U)) {
+                return;
+            }
+        } else {
+            if (commitRead(14, 17U)) {
+                return;
+            }
+            if (commitRead(6, 9U)) {
+                return;
+            }
+        }
+    } else { // WRITE
+        if (eepromAddressBits_ == 6) {
+            if (commitWrite(6, 73U)) {
+                return;
+            }
+            if (commitWrite(14, 81U)) {
+                return;
+            }
+        } else {
+            if (commitWrite(14, 81U)) {
+                return;
+            }
+            if (commitWrite(6, 73U)) {
+                return;
+            }
+        }
+    }
+
+    // Evita crescimento indefinido caso o jogo envie comando inesperado.
+    if (eepromWriteBits_.size() > 96U) {
+        eepromWriteBits_.clear();
+    }
+}
+
+void Memory::handleFlashCommandWrite(u32 address, u8 value) {
+    const u32 local = (address - kBackupSramFlashBase) & kBackupSramFlashMask;
+    if (value == 0xF0U) {
+        flashIdMode_ = false;
+        flashStage_ = FlashStage::Ready;
+        return;
+    }
+
+    switch (flashStage_) {
+    case FlashStage::Ready:
+        if (local == kFlashUnlockAddr1 && value == 0xAAU) {
+            flashStage_ = FlashStage::Unlock1;
+        }
+        break;
+    case FlashStage::Unlock1:
+        flashStage_ = (local == kFlashUnlockAddr2 && value == 0x55U)
+            ? FlashStage::Unlock2
+            : FlashStage::Ready;
+        break;
+    case FlashStage::Unlock2:
+        if (local != kFlashUnlockAddr1) {
+            flashStage_ = FlashStage::Ready;
+            break;
+        }
+        switch (value) {
+        case 0x90U:
+            flashIdMode_ = true;
+            flashStage_ = FlashStage::Ready;
+            break;
+        case 0xA0U:
+            flashStage_ = FlashStage::ProgramByte;
+            break;
+        case 0x80U:
+            flashStage_ = FlashStage::EraseUnlock1;
+            break;
+        case 0xB0U:
+            flashStage_ = FlashStage::BankSelect;
+            break;
+        default:
+            flashStage_ = FlashStage::Ready;
+            break;
+        }
+        break;
+    case FlashStage::ProgramByte:
+        programFlashByte(address, value);
+        flashStage_ = FlashStage::Ready;
+        break;
+    case FlashStage::EraseUnlock1:
+        flashStage_ = (local == kFlashUnlockAddr1 && value == 0xAAU)
+            ? FlashStage::EraseUnlock2
+            : FlashStage::Ready;
+        break;
+    case FlashStage::EraseUnlock2:
+        flashStage_ = (local == kFlashUnlockAddr2 && value == 0x55U)
+            ? FlashStage::EraseCommand
+            : FlashStage::Ready;
+        break;
+    case FlashStage::EraseCommand:
+        if (local == kFlashUnlockAddr1 && value == 0x10U) {
+            eraseFlashChip();
+        } else if (value == 0x30U) {
+            eraseFlashSector(address);
+        }
+        flashStage_ = FlashStage::Ready;
+        break;
+    case FlashStage::BankSelect:
+        if (backupType_ == BackupType::Flash128 && local == 0U) {
+            flashBank_ = static_cast<u8>(value & 0x1U);
+        }
+        flashStage_ = FlashStage::Ready;
+        break;
+    default:
+        flashStage_ = FlashStage::Ready;
+        break;
+    }
+}
+
+u8 Memory::readFlash8(u32 address) const {
+    const u32 local = (address - kBackupSramFlashBase) & kBackupSramFlashMask;
+    if (flashIdMode_) {
+        if (local == 0U) {
+            return backupType_ == BackupType::Flash128 ? 0x62U : 0xBFU;
+        }
+        if (local == 1U) {
+            return backupType_ == BackupType::Flash128 ? 0x13U : 0xD4U;
+        }
+        return 0xFFU;
+    }
+
+    if (backupStorage_.empty()) {
+        return 0xFFU;
+    }
+    std::size_t idx = static_cast<std::size_t>(local);
+    if (backupType_ == BackupType::Flash128) {
+        idx += static_cast<std::size_t>(flashBank_ & 0x1U) * kFlash64Size;
+    }
+    idx %= backupStorage_.size();
+    return backupStorage_[idx];
+}
+
+void Memory::programFlashByte(u32 address, u8 value) {
+    if (backupStorage_.empty()) {
+        return;
+    }
+    const u32 local = (address - kBackupSramFlashBase) & kBackupSramFlashMask;
+    std::size_t idx = static_cast<std::size_t>(local);
+    if (backupType_ == BackupType::Flash128) {
+        idx += static_cast<std::size_t>(flashBank_ & 0x1U) * kFlash64Size;
+    }
+    idx %= backupStorage_.size();
+
+    if (backupStorage_[idx] != value) {
+        backupStorage_[idx] = value;
+        backupDirty_ = true;
+    }
+}
+
+void Memory::eraseFlashSector(u32 address) {
+    if (backupStorage_.empty()) {
+        return;
+    }
+    const u32 local = (address - kBackupSramFlashBase) & kBackupSramFlashMask;
+    std::size_t idx = static_cast<std::size_t>(local & ~0x0FFFU);
+    if (backupType_ == BackupType::Flash128) {
+        idx += static_cast<std::size_t>(flashBank_ & 0x1U) * kFlash64Size;
+    }
+    if (idx >= backupStorage_.size()) {
+        return;
+    }
+    const std::size_t end = std::min(idx + 0x1000U, backupStorage_.size());
+    std::fill(backupStorage_.begin() + static_cast<std::ptrdiff_t>(idx), backupStorage_.begin() + static_cast<std::ptrdiff_t>(end), 0xFFU);
+    backupDirty_ = true;
+}
+
+void Memory::eraseFlashChip() {
+    if (backupStorage_.empty()) {
+        return;
+    }
+    std::fill(backupStorage_.begin(), backupStorage_.end(), 0xFFU);
+    backupDirty_ = true;
 }
 
 u8* Memory::writableBytePointer(u32 address) {

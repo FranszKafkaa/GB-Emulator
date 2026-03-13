@@ -34,6 +34,16 @@ public:
     [[nodiscard]] bool inHblank() const;
 
 private:
+    struct AffineLineSnapshot {
+        std::int32_t pa = 0;
+        std::int32_t pb = 0;
+        std::int32_t pc = 0;
+        std::int32_t pd = 0;
+        std::int32_t xRef = 0;
+        std::int32_t yRef = 0;
+        bool valid = false;
+    };
+
     struct LayerPixel {
         u16 color = 0;
         u16 rawColor555 = 0;
@@ -45,6 +55,23 @@ private:
         bool opaque = false;
         bool hasSecond = false;
         bool semiTransparentObj = false;
+    };
+
+    struct RasterLineSnapshot {
+        u16 dispcnt = 0;
+        u16 win0H = 0;
+        u16 win1H = 0;
+        u16 win0V = 0;
+        u16 win1V = 0;
+        u16 winIn = 0;
+        u16 winOut = 0;
+        u16 bldCnt = 0;
+        u16 bldAlpha = 0;
+        u16 bldY = 0;
+        std::array<u16, 4> bgCnt{};
+        std::array<u16, 4> bgHofs{};
+        std::array<u16, 4> bgVofs{};
+        bool valid = false;
     };
 
     static constexpr u32 Bg0CntOffset = 0x0008U;
@@ -66,6 +93,7 @@ private:
         std::array<LayerPixel, FramebufferSize>& layerPixels
     ) const;
     void renderObjects(std::array<LayerPixel, FramebufferSize>& layerPixels) const;
+    void buildObjWindowMask(std::array<bool, FramebufferSize>& objWindowMask) const;
     void composeLayer(
         std::array<LayerPixel, FramebufferSize>& layerPixels,
         std::size_t pixelIndex,
@@ -84,11 +112,21 @@ private:
     [[nodiscard]] static u8 blendLayerBitFromLayerId(u8 layerId);
 
     [[nodiscard]] u16 readVram16(std::size_t byteIndex) const;
+    [[nodiscard]] u8 readBgVram8(std::size_t byteIndex) const;
+    [[nodiscard]] u16 readBgVram16(std::size_t byteIndex) const;
     [[nodiscard]] u16 readOam16(std::size_t byteIndex) const;
     [[nodiscard]] u16 readBgPaletteColor(u8 colorIndex) const;
     [[nodiscard]] u16 readObjPaletteColor(u8 colorIndex) const;
 
     void fillBackdrop(std::array<u16, FramebufferSize>& framebuffer) const;
+    void clearRasterLineSnapshots();
+    [[nodiscard]] RasterLineSnapshot readCurrentRasterSnapshot() const;
+    void captureRasterLineSnapshot(int line);
+    [[nodiscard]] RasterLineSnapshot rasterSnapshotForLine(int line) const;
+    void clearAffineLineSnapshots();
+    void captureAffineLineSnapshot(int line);
+    [[nodiscard]] AffineLineSnapshot readCurrentAffineSnapshot(int bgIndex) const;
+    [[nodiscard]] AffineLineSnapshot affineSnapshotForLine(int bgIndex, int line) const;
     void updateIoRegisters();
     [[nodiscard]] static u16 bgr555ToRgb565(u16 pixel);
 
@@ -98,6 +136,10 @@ private:
     bool prevVblank_ = false;
     bool prevHblank_ = false;
     bool prevVcounterMatch_ = false;
+    std::array<RasterLineSnapshot, VisibleLines> rasterLineSnapshots_{};
+    std::array<AffineLineSnapshot, VisibleLines> bg2LineSnapshots_{};
+    std::array<AffineLineSnapshot, VisibleLines> bg3LineSnapshots_{};
+    mutable const std::array<bool, FramebufferSize>* activeObjWindowMask_ = nullptr;
 };
 
 } // namespace gb::gba

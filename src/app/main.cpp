@@ -13,10 +13,7 @@
 #include "gb/core/gba/system.hpp"
 
 #ifdef GBEMU_USE_SDL2
-#include <SDL2/SDL.h>
-#ifdef GBEMU_USE_SDL2_IMAGE
-#include <SDL2/SDL_image.h>
-#endif
+#include "gb/app/sdl_compat.hpp"
 #endif
 
 namespace {
@@ -127,6 +124,18 @@ bool loadGbaGame(gb::gba::System& system, const gb::AppOptions& options) {
     std::cout << "header: logo=" << (meta.validNintendoLogo ? "ok" : "invalida")
               << " fixed=" << (meta.validFixedByte ? "ok" : "invalido")
               << " checksum=" << (meta.validHeaderChecksum ? "ok" : "invalido") << "\n";
+    std::cout << "perfil de compatibilidade: " << system.compatibilityProfile().name << "\n";
+
+    if (system.hasPersistentBackup()) {
+        const std::string batteryPath = gb::batteryRamPathForRom(options.romPath);
+        std::cout << "backup detectado: " << system.backupTypeName() << "\n";
+        const bool hasFile = std::filesystem::exists(std::filesystem::path(batteryPath));
+        if (system.loadBackupFromFile(batteryPath)) {
+            std::cout << "save interno GBA carregado: " << batteryPath << "\n";
+        } else if (hasFile) {
+            std::cout << "save interno GBA ignorado (formato incompativel): " << batteryPath << "\n";
+        }
+    }
     return true;
 }
 
@@ -205,6 +214,10 @@ int runRealtimeFlow(gb::AppOptions& options) {
 } // namespace
 
 int main(int argc, char** argv) {
+#ifdef GBEMU_USE_SDL2
+    SDL_SetMainReady();
+#endif
+
     gb::AppOptions options{};
     std::string parseError;
     if (!gb::parseAppOptions(argc, argv, options, parseError)) {
@@ -264,9 +277,15 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        const std::string batteryPath = gb::batteryRamPathForRom(options.romPath);
+
 #ifdef GBEMU_USE_SDL2
         if (!options.headless) {
-            return gb::runGbaRealtime(gbaSystem, options.scale);
+            const int rc = gb::runGbaRealtime(gbaSystem, options.scale);
+            if (gbaSystem.hasPersistentBackup() && gbaSystem.saveBackupToFile(batteryPath)) {
+                std::cout << "save interno GBA gravado: " << batteryPath << "\n";
+            }
+            return rc;
         }
 #else
         if (!options.headless) {
@@ -277,6 +296,9 @@ int main(int argc, char** argv) {
         const int frames = std::max(1, options.frames);
         for (int i = 0; i < frames; ++i) {
             gbaSystem.runFrame();
+        }
+        if (gbaSystem.hasPersistentBackup() && gbaSystem.saveBackupToFile(batteryPath)) {
+            std::cout << "save interno GBA gravado: " << batteryPath << "\n";
         }
         std::cout << "execucao headless GBA finalizada (" << frames << " frames)\n";
         return 0;

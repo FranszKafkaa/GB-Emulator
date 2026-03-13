@@ -38,6 +38,15 @@ struct InputState {
     bool l = false;
 };
 
+struct CompatibilityProfile {
+    std::string name = "default";
+    bool forceScanlineFrameSync = false;
+    bool enableAdaptiveScanlineFallback = true;
+    bool useFlashCompatibilityMode = false;
+    int forcedEepromAddressBits = 0; // 0=auto, 6/14 for override
+    bool strictBackupFileSize = false;
+};
+
 class System {
 public:
     static constexpr int ScreenWidth = 240;
@@ -50,6 +59,11 @@ public:
     [[nodiscard]] const std::vector<u8>& romData() const;
     [[nodiscard]] const RomMetadata& metadata() const;
     [[nodiscard]] bool loaded() const;
+    [[nodiscard]] bool hasPersistentBackup() const;
+    [[nodiscard]] const std::string& backupTypeName() const;
+    [[nodiscard]] const CompatibilityProfile& compatibilityProfile() const;
+    bool loadBackupFromFile(const std::string& path);
+    bool saveBackupToFile(const std::string& path) const;
 
     [[nodiscard]] const std::array<u16, FramebufferSize>& framebuffer() const;
     [[nodiscard]] std::array<u16, FramebufferSize>& framebuffer();
@@ -65,17 +79,21 @@ public:
 
 private:
     void refreshMetadata();
+    void configureCompatibilityProfile();
     void renderBootstrapFrame();
     void renderExecutionFrame();
 
     std::string romPath_{};
     std::vector<u8> romData_{};
     RomMetadata metadata_{};
+    CompatibilityProfile compatibilityProfile_{};
     Memory memory_{};
     Ppu ppu_{};
     CpuArm7tdmi cpu_{};
     std::array<u16, FramebufferSize> framebuffer_{};
     std::uint32_t frameCounter_ = 0;
+    bool adaptiveScanlineSync_ = false;
+    int startupNoDisplayFrames_ = 0;
 };
 
 } // namespace gb::gba

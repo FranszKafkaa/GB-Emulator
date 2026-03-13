@@ -1,6 +1,8 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
+#include <string>
 #include <vector>
 
 #include "gb/core/types.hpp"
@@ -9,6 +11,14 @@ namespace gb::gba {
 
 class Memory {
 public:
+    enum class BackupType {
+        None,
+        Sram,
+        Flash64,
+        Flash128,
+        Eeprom,
+    };
+
     static constexpr std::size_t EwramSize = 0x40000; // 256 KiB
     static constexpr std::size_t IwramSize = 0x8000;  // 32 KiB
     static constexpr std::size_t PramSize = 0x400;    // 1 KiB (palette RAM)
@@ -59,8 +69,26 @@ public:
     [[nodiscard]] bool interruptMasterEnabled() const;
     [[nodiscard]] u16 pendingInterrupts() const;
     void triggerDmaStart(u16 startTiming);
+    [[nodiscard]] bool hasPersistentBackup() const;
+    [[nodiscard]] const std::string& backupTypeName() const;
+    void configureBackupBehavior(int forcedEepromAddressBits, bool strictBackupFileSize);
+    void setFlashCompatibilityMode(bool enabled);
+    [[nodiscard]] bool flashCompatibilityMode() const;
+    bool loadBackupFromFile(const std::string& path);
+    bool saveBackupToFile(const std::string& path) const;
 
 private:
+    enum class FlashStage {
+        Ready,
+        Unlock1,
+        Unlock2,
+        ProgramByte,
+        EraseUnlock1,
+        EraseUnlock2,
+        EraseCommand,
+        BankSelect,
+    };
+
     struct TimerState {
         u16 reload = 0;
         u16 counter = 0;
@@ -85,6 +113,23 @@ private:
     void updateKeypadInterrupt();
 
     [[nodiscard]] u8 readRom8(u32 address) const;
+    void detectBackupType();
+    void resetBackupState();
+    [[nodiscard]] std::size_t effectiveEepromAddressBits() const;
+    [[nodiscard]] std::size_t backupPersistSizeBytes() const;
+    [[nodiscard]] u8 readBackup8(u32 address) const;
+    void writeBackup8(u32 address, u8 value);
+    [[nodiscard]] bool isEepromBackup() const;
+    [[nodiscard]] bool isFlashBackup() const;
+    [[nodiscard]] u8 readEepromBit() const;
+    void pushEepromReadBlock(u32 addressWord);
+    void handleEepromWriteBit(u8 bit);
+    void maybeCommitEepromCommand();
+    void handleFlashCommandWrite(u32 address, u8 value);
+    [[nodiscard]] u8 readFlash8(u32 address) const;
+    void programFlashByte(u32 address, u8 value);
+    void eraseFlashSector(u32 address);
+    void eraseFlashChip();
     [[nodiscard]] u8* writableBytePointer(u32 address);
     [[nodiscard]] const u8* writableBytePointer(u32 address) const;
 
@@ -96,6 +141,25 @@ private:
     std::array<u8, OamSize> oam_{};
     std::array<u8, IoSize> io_{};
     std::array<TimerState, 4> timers_{};
+    BackupType backupType_ = BackupType::None;
+    std::string backupTypeName_ = "NONE";
+    std::vector<u8> backupStorage_{};
+    bool backupDirty_ = false;
+    bool flashCompatibilityMode_ = false;
+    int forcedEepromAddressBits_ = 0;
+    bool strictBackupFileSize_ = false;
+
+    // EEPROM serial stream (DMA halfword writes/reads on 0x0Dxxxxxx).
+    int eepromAddressBits_ = 0;
+    int eepromExpectedWriteBits_ = 0;
+    std::vector<u8> eepromWriteBits_{};
+    mutable std::vector<u8> eepromReadBits_{};
+    mutable std::size_t eepromReadCursor_ = 0;
+
+    // FLASH command state (0x0Exxxxxx).
+    FlashStage flashStage_ = FlashStage::Ready;
+    bool flashIdMode_ = false;
+    u8 flashBank_ = 0;
 };
 
 } // namespace gb::gba
